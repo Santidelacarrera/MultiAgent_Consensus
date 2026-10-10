@@ -31,8 +31,11 @@ class OrchestratorClient:
             raise OrchestratorError(f"orquestador respondió {r.status_code}: {r.text[:300]}")
         return r.json() if "json" in r.headers.get("content-type", "") else r.text
 
-    def submit(self, payload: dict[str, Any], force: bool = False) -> dict[str, Any]:
-        return self._check(self._http.post("/v1/debates", json={"pr": payload, "force": force}))
+    def submit(self, payload: dict[str, Any], force: bool = False, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {"pr": payload, "force": force}
+        if settings:
+            body["settings"] = settings
+        return self._check(self._http.post("/v1/debates", json=body))
 
     def get(self, debate_id: str, wait_ms: int = 0) -> dict[str, Any]:
         return self._check(self._http.get(f"/v1/debates/{debate_id}", params={"waitMs": wait_ms}))

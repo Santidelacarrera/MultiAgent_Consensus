@@ -42,6 +42,7 @@ class World:
     permission: str = "write"
     calls: list[tuple[str, str, Any]] = field(default_factory=list)
     comments: list[dict[str, Any]] = field(default_factory=list)  # comentarios existentes en el PR/MR
+    repo_config: str | None = None
 
     def of(self, method: str, path_prefix: str) -> list[tuple[str, str, Any]]:
         return [c for c in self.calls if c[0] == method and c[1].startswith(path_prefix)]
@@ -86,6 +87,8 @@ class World:
             return httpx.Response(200, json={"head": {"sha": SHA}, "title": "T", "user": {"login": "dev"}, "base": {"ref": "main"}, "body": "desc", "labels": [{"name": "x"}]})
         if method == "GET" and path == "/repos/acme/shop/pulls/7/files":
             return httpx.Response(200, json=[{"filename": "src/a.ts", "status": "modified", "patch": "@@ -1 +1 @@\n-old\n+new"}, {"filename": "img.png", "status": "added"}])
+        if method == "GET" and path == "/repos/acme/shop/contents/.consensus.json":
+            return httpx.Response(404) if self.repo_config is None else httpx.Response(200, text=self.repo_config)
         if method == "POST" and path.startswith("/repos/acme/shop/statuses/"):
             return httpx.Response(201, json={})
         if method == "GET" and path == "/repos/acme/shop/issues/7/comments":
