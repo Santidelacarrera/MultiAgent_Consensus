@@ -7,6 +7,8 @@ import { DebateStore, STORE } from '../store/store';
 import { DebateRecord, DebateResult, DebateStatus, HumanResolution, StoredEvent } from '../types';
 import { CONFIG } from '../tokens';
 import { DebateEngine } from './debate_engine';
+import { filterDiff } from './diff_filter';
+import { RepoSettings } from './pr_input';
 import { Metrics } from './metrics';
 import { renderMinutes } from './minutes';
 
@@ -59,7 +61,7 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
   }
 
   /** Crea (o reutiliza) el debate de un PR en un commit concreto y lo ejecuta en segundo plano. */
-  async submit(pr: PullRequestContext, opts: { force?: boolean } = {}): Promise<DebateRecord> {
+  async submit(pr: PullRequestContext, opts: { force?: boolean; settings?: RepoSettings } = {}): Promise<DebateRecord> {
     if (!opts.force) {
       const existing = await this.store.findByPrAndSha(pr.id, pr.headSha);
       if (existing && existing.status !== 'error') return existing;
@@ -84,24 +86,24 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
       finishedAt: null,
     };
     await this.store.saveDebate(rec);
-    const p = this.execute(rec, pr).finally(() => this.running.delete(id));
+    const p = this.execute(rec, pr, opts.settings ?? {}).finally(() => this.running.delete(id));
     this.running.set(id, p);
     p.catch(() => undefined);
     return rec;
   }
 
-  private async execute(rec: DebateRecord, pr: PullRequestContext): Promise<DebateRecord> {
+  private async execute(rec: DebateRecord, pr: PullRequestContext, settings: RepoSettings): Promise<DebateRecord> {
     await this.acquire();
     this.counters.debateRunning(1);
     try {
-      return await this.executeNow(rec, pr);
+      return await this.executeNow(rec, pr, settings);
     } finally {
       this.counters.debateRunning(-1);
       this.release();
     }
   }
 
-  private async executeNow(rec: DebateRecord, pr: PullRequestContext): Promise<DebateRecord> {
+  private async executeNow(rec: DebateRecord, basePr: PullRequestContext, settings: RepoSettings): Promise<DebateRecord> {
     const emit = async (type: string, payload: Record<string, unknown>) => {
       const at = new Date().toISOString();
       if (type === 'agent.fault') this.counters.fault(String(payload.kind));
@@ -119,11 +121,14 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
       await this.bus.publish(streams.debateEvents(rec.id), { type, at, ...payload });
     };
     try {
+      const { diff, ignored } = filterDiff(basePr.diff, settings.ignorePaths ?? []);
+      const pr: PullRequestContext = { ...basePr, diff, settings: settings.monthlyBudgetUsd ? { monthlyBudgetUsd: settings.monthlyBudgetUsd } : undefined };
+      if (ignored.length) await emit('diff.filtered', { ignored });
       const engine = new DebateEngine({
         bus: this.bus,
         busSecret: this.config.busSecret,
         agents: [...AGENT_IDS],
-        policy: this.config.policy,
+        policy: { ...this.config.policy, maxRounds: settings.maxRounds ?? this.config.policy.maxRounds },
         agentTimeoutMs: this.config.agentTimeoutMs,
       });
       const result = await engine.run(rec.id, pr, emit);

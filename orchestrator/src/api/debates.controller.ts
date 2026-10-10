@@ -1,7 +1,7 @@
 import {
   Body, ConflictException, Controller, Get, Header, HttpCode, NotFoundException, Param, Post, Query, UseGuards, BadRequestException,
 } from '@nestjs/common';
-import { InvalidPrInput, parsePullRequest } from '../debate/pr_input';
+import { InvalidPrInput, parsePullRequest, parseRepoSettings } from '../debate/pr_input';
 import { ConflictError, DebateService, NotFoundError, ValidationError } from '../debate/debate_service';
 import { DebateRecord } from '../types';
 import { ApiKeyGuard } from './api_key.guard';
@@ -46,10 +46,11 @@ export class DebatesController {
 
   @Post()
   @HttpCode(202)
-  submit(@Body() body: { pr?: unknown; force?: boolean }) {
+  submit(@Body() body: { pr?: unknown; force?: boolean; settings?: unknown }) {
     return wrap(async () => {
       const pr = parsePullRequest(body?.pr);
-      return toView(await this.debates.submit(pr, { force: body?.force === true }));
+      const settings = parseRepoSettings(body?.settings);
+      return toView(await this.debates.submit(pr, { force: body?.force === true, settings }));
     });
   }
 

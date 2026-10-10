@@ -364,6 +364,23 @@ Comportamiento común:
 
 ---
 
+## Configuración por repositorio
+
+Cada repositorio puede ajustar el gate con un `.consensus.json` en su raíz (ejemplo: `examples/consensus.json`):
+
+| Clave | Efecto |
+|-------|--------|
+| `monthlyBudgetUsd` | Presupuesto incremental de FinOps para ese repo (sustituye a `MONTHLY_BUDGET_USD`) |
+| `maxRounds` | Rondas antes de escalar (1–5) |
+| `ignorePaths` | Globs (`*`, `**`, `?`) de ficheros excluidos del debate: código generado, *vendor*, lockfiles |
+
+El gatekeeper lo lee de la **rama base**, nunca de la del PR: el autor de un cambio no puede aflojar sus propias reglas.
+Sólo se aceptan estas tres claves —no se puede desactivar el veto de seguridad—, el orquestador valida los rangos
+(valores fuera de rango ⇒ `400`) y los ficheros ignorados quedan registrados en el log del debate (`diff.filtered`).
+Un fichero ausente o ilegible ⇒ valores por defecto.
+
+---
+
 ## API del orquestador
 
 Autenticación: cabecera `x-api-key: $ORCHESTRATOR_API_KEY` (o `Authorization: Bearer …`). `/health` es público.
@@ -383,7 +400,8 @@ Cuerpo de `POST /v1/debates`:
 
 ```json
 { "pr": { "provider": "github", "repo": "acme/shop", "number": 7, "title": "…", "headSha": "abc1234",
-          "diff": "diff --git a/…", "author": "dev", "description": "…" }, "force": false }
+          "diff": "diff --git a/…", "author": "dev", "description": "…" }, "force": false,
+  "settings": { "monthlyBudgetUsd": 500, "maxRounds": 3, "ignorePaths": ["vendor/**"] } }
 ```
 
 ### Streams de Redis

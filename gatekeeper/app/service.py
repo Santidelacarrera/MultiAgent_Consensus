@@ -1,6 +1,7 @@
 """Caso de uso del gatekeeper: PR → debate → veredicto → acciones sobre la plataforma."""
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Callable
 
@@ -11,6 +12,27 @@ from .policy import decide, parse_command
 from .vcs import VcsClient, VcsError
 
 log = logging.getLogger("gatekeeper")
+
+CONFIG_PATH = ".consensus.json"
+
+
+def load_repo_settings(vcs: VcsClient, ref: PrRef) -> dict[str, Any]:
+    """Lee `.consensus.json` de la rama BASE (el autor del PR no puede aflojar sus propias reglas).
+
+    Claves admitidas: monthlyBudgetUsd, maxRounds, ignorePaths. Un fichero inválido se ignora (valores por defecto)
+    y se avisa en el log; el orquestador vuelve a validar los rangos.
+    """
+    try:
+        raw = vcs.get_file(ref, CONFIG_PATH)
+        if raw is None:
+            return {}
+        data = json.loads(raw)
+    except (VcsError, ValueError) as e:
+        log.warning("%s ilegible en %s: %s", CONFIG_PATH, ref.repo, e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: data[k] for k in ("monthlyBudgetUsd", "maxRounds", "ignorePaths") if k in data}
 
 
 class GateService:
@@ -38,7 +60,10 @@ class GateService:
             if not ref.head_sha:
                 ref = vcs.get_pr(ref)
             vcs.set_status(ref, "pending", "Debate multi-agente en curso…")
+            if not ref.base_branch:
+                ref = vcs.get_pr(ref)
             diff = vcs.get_diff(ref)
+            settings = load_repo_settings(vcs, ref)
             view = self.orchestrator.submit(
                 {
                     "provider": ref.provider,
@@ -51,7 +76,8 @@ class GateService:
                     "headSha": ref.head_sha,
                     "labels": list(ref.labels),
                     "diff": diff,
-                }
+                },
+                settings=settings,
             )
             if view.get("status") == "running":
                 view = self.orchestrator.wait(view["id"], self.settings.debate_timeout_s)

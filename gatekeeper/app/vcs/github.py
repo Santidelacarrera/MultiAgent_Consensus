@@ -81,6 +81,14 @@ class GitHubClient:
             page += 1
         return "\n".join(out) + "\n"
 
+    def get_file(self, ref: PrRef, path: str) -> str | None:
+        r = self._http.get(f"/repos/{ref.repo}/contents/{path}", params={"ref": ref.base_branch}, headers={"Accept": "application/vnd.github.raw+json"})
+        if r.status_code == 404:
+            return None
+        if r.status_code != 200:
+            raise VcsError(f"GitHub contents {path} → {r.status_code}")
+        return r.text
+
     def set_status(self, ref: PrRef, state: str, description: str, target_url: str | None = None) -> None:
         body: dict[str, Any] = {"state": state, "description": description[:140], "context": self._s.status_context}
         if target_url:

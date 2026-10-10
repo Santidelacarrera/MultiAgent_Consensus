@@ -1,0 +1,5 @@
+{
+  "monthlyBudgetUsd": 500,
+  "maxRounds": 3,
+  "ignorePaths": ["vendor/**", "**/*.min.js", "**/generated/**", "package-lock.json"]
+}

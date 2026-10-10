@@ -65,6 +65,14 @@ class GitLabClient:
                 out.append(diff.rstrip("\n"))
         return "\n".join(out) + "\n"
 
+    def get_file(self, ref: PrRef, path: str) -> str | None:
+        r = self._http.get(f"/projects/{self._pid(ref)}/repository/files/{quote(path, safe='')}/raw", params={"ref": ref.base_branch})
+        if r.status_code == 404:
+            return None
+        if r.status_code != 200:
+            raise VcsError(f"GitLab files {path} → {r.status_code}")
+        return r.text
+
     def set_status(self, ref: PrRef, state: str, description: str, target_url: str | None = None) -> None:
         gl_state = {"success": "success", "failure": "failed", "error": "failed", "pending": "running"}.get(state, "pending")
         params: dict[str, Any] = {"state": gl_state, "name": self._s.status_context, "description": description[:140]}

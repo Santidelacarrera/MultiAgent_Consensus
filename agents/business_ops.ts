@@ -248,9 +248,9 @@ export class BusinessOpsAgent extends BaseAgent {
     this.blastFiles = opts.blastRadiusFiles ?? 40;
   }
 
-  protected analyze(files: FileChange[], _pr: PullRequestContext): Finding[] {
+  protected analyze(files: FileChange[], pr: PullRequestContext): Finding[] {
     const out = this.applyLineRules(RULES, files);
-    out.push(...this.costDelta(files));
+    out.push(...this.costDelta(files, pr.settings?.monthlyBudgetUsd ?? this.budget));
     out.push(...this.removedSafeguards(files));
     if (files.length > this.blastFiles) {
       out.push(
@@ -269,7 +269,7 @@ export class BusinessOpsAgent extends BaseAgent {
   }
 
   /** Delta de coste mensual estimado = coste(líneas añadidas) − coste(líneas eliminadas). */
-  private costDelta(files: FileChange[]): Finding[] {
+  private costDelta(files: FileChange[], budget: number): Finding[] {
     let delta = 0;
     const added: CostItem[] = [];
     const breakdown: string[] = [];
@@ -284,8 +284,8 @@ export class BusinessOpsAgent extends BaseAgent {
       breakdown.push(`${f.path}: ${d >= 0 ? '+' : '−'}$${Math.abs(Math.round(d))}`);
     }
     delta = Math.round(delta);
-    if (delta < this.budget / 20) return [];
-    const severity: Severity = delta >= this.budget ? 'high' : delta >= this.budget / 5 ? 'medium' : 'low';
+    if (delta < budget / 20) return [];
+    const severity: Severity = delta >= budget ? 'high' : delta >= budget / 5 ? 'medium' : 'low';
     const top = added.sort((a, b) => b.usd - a.usd).slice(0, 3);
     const evidence = top.map((i) => {
       const [file, text] = i.text.split('\u0000');
@@ -296,7 +296,7 @@ export class BusinessOpsAgent extends BaseAgent {
         category: 'cost',
         severity,
         confidence: 0.8,
-        title: `Incremento de coste estimado: +$${delta}/mes (presupuesto $${this.budget})`,
+        title: `Incremento de coste estimado: +$${delta}/mes (presupuesto $${budget})`,
         description: `Estimación on-demand a partir de la infraestructura modificada (${breakdown.join('; ')}). ${severity === 'high' ? 'Supera el presupuesto incremental sin aprobación FinOps.' : 'Dentro de un margen vigilado.'}`,
         remediation: 'Dimensionar según carga medida, usar autoscaling con techo, Savings Plans/Spot y registrar la aprobación FinOps si procede.',
         evidence,

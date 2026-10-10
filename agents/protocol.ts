@@ -95,6 +95,8 @@ export interface PullRequestContext {
   /** Diff unificado completo del PR. */
   diff: string;
   labels?: string[];
+  /** Ajustes por repositorio (validados por el orquestador). */
+  settings?: { monthlyBudgetUsd?: number };
 }
 
 // ---------------------------------------------------------------------------
