@@ -13,6 +13,8 @@ export interface AppConfig {
   monthlyBudgetUsd: number;
   /** Retención (s) de los streams Redis por debate una vez concluido. */
   streamTtlSeconds: number;
+  /** Debates simultáneos máximos; el resto espera en cola (protege al LLM y a Redis). */
+  maxConcurrentDebates: number;
   policy: ConsensusPolicy;
   env: Record<string, string | undefined>;
 }
@@ -36,6 +38,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     busSecret: env.BUS_SECRET ?? 'dev-only-bus-secret-change-me',
     agentTimeoutMs: num(env.AGENT_TIMEOUT_MS, 120_000),
     monthlyBudgetUsd: num(env.MONTHLY_BUDGET_USD, 1000),
+    maxConcurrentDebates: num(env.MAX_CONCURRENT_DEBATES, 4),
     streamTtlSeconds: num(env.STREAM_TTL_SECONDS, 7 * 86_400),
     policy: {
       ...DEFAULT_POLICY,
@@ -44,6 +47,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     },
     env,
   };
+  if (cfg.maxConcurrentDebates < 1) throw new Error('MAX_CONCURRENT_DEBATES debe ser >= 1');
   if (cfg.policy.maxRounds < 1) throw new Error('MAX_ROUNDS debe ser >= 1');
   if (process.env.NODE_ENV === 'production' && cfg.busSecret === 'dev-only-bus-secret-change-me') {
     throw new Error('BUS_SECRET debe configurarse en producción');
