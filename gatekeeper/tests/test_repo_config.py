@@ -44,6 +44,6 @@ def test_gitlab_reads_config_from_target_branch(make_client, world):
     client = GitLabClient(make_settings(), transport=httpx.MockTransport(handler))
     ref = PrRef("gitlab", "grp/proj", 3, base_branch="develop", project_id=42)
     assert client.get_file(ref, ".consensus.json") == '{"maxRounds": 2}'
-    assert seen["path"].startswith("/api/v4/projects/42/repository/files/.consensus.json/raw") or "%2E" in seen["path"] or ".consensus.json" in seen["path"]
+    assert seen["path"].split("?")[0] == "/api/v4/projects/42/repository/files/.consensus.json/raw"
     assert seen["params"] == {"ref": "develop"}
     assert GitLabClient(make_settings(), transport=httpx.MockTransport(lambda r: httpx.Response(404))).get_file(ref, "x") is None
