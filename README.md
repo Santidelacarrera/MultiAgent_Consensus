@@ -473,14 +473,14 @@ adicionales, contra-argumentos y decisiones de defensa en JSON. La salida del LL
 ```bash
 npm install
 npm run typecheck
-npm test                     # Jest: agentes, consenso, motor de debate, API HTTP, Redis Streams real, PostgreSQL (pg-mem)
+npm test                     # Jest: agentes, consenso, motor de debate, API HTTP, Redis Streams real, PostgreSQL real + pg-mem
 
 cd gatekeeper
 python3 -m pip install -r requirements-dev.txt
 python3 -m pytest -q         # webhooks, firmas, política, comandos humanos, GitHub/GitLab simulados
 ```
 
-- Los tests de Redis arrancan un `redis-server` efímero (si no está instalado, se omiten con un aviso).
+- Los tests de Redis y de PostgreSQL arrancan un `redis-server` y un PostgreSQL efímeros (si los binarios no están instalados, se omiten con un aviso; PostgreSQL además se prueba con `pg-mem`).
 - `npm run build && npm start` ejecuta el orquestador compilado.
 - CI: `.github/workflows/ci.yml` (Node con `redis-server` efímero, Python y validación/build de Compose).
 
@@ -494,7 +494,7 @@ python3 -m pytest -q         # webhooks, firmas, política, comandos humanos, Gi
 - La estimación de costes es **aproximada** (precios on-demand de referencia); sirve para detectar saltos de orden de
   magnitud, no para facturar.
 - La capa LLM está verificada con proveedores simulados y `fetch` falso; no se ha ejercitado contra la API real de Claude/Ollama.
-- GitHub/GitLab se prueban contra transportes HTTP simulados, y PostgreSQL contra `pg-mem`. Las imágenes Docker y el
+- GitHub/GitLab se prueban contra transportes HTTP simulados. PostgreSQL se prueba contra un servidor real (PostgreSQL 16 efímero) además de `pg-mem`. Las imágenes Docker y el
   `docker compose up` no se han podido construir en el entorno de desarrollo (sin daemon de Docker): `docker compose config` valida el fichero.
 - Un único orquestador coordina el debate (sin alta disponibilidad activa-activa); los debates `running` huérfanos tras un
   reinicio se marcan como `error` y el gatekeeper puede reenviarlos.

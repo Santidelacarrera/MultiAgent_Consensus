@@ -8,6 +8,14 @@ import { DebateStore } from '../src/store/store';
 import { renderMinutes } from '../src/debate/minutes';
 import { DebateRecord } from '../src/types';
 import { makeHarness } from './helpers';
+import { PgHandle, startPostgres } from './pg_helper';
+
+let realPg: PgHandle | null = null;
+beforeAll(async () => {
+  realPg = await startPostgres();
+  if (!realPg) console.warn('PostgreSQL real no disponible: se omiten los tests contra un servidor real');
+}, 30000);
+afterAll(async () => realPg?.stop());
 
 const rec = (over: Partial<DebateRecord> = {}): DebateRecord => ({
   id: 'd1', prId: 'github:a/b#1', provider: 'github', repo: 'a/b', prNumber: 1, headSha: 'abcdef1', title: 'T', status: 'running',
@@ -21,6 +29,15 @@ const stores: [string, () => Promise<DebateStore>][] = [
     async () => {
       const { Pool } = newDb().adapters.createPg();
       return new PgStore(new Pool());
+    },
+  ],
+  [
+    'PgStore (PostgreSQL real)',
+    async () => {
+      if (!realPg) return new MemoryStore(); // sin servidor: el contrato se comprueba igualmente contra memoria
+      const store = PgStore.fromUrl(realPg.url);
+      await (store as unknown as { pool: { query(q: string): Promise<unknown> } }).pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+      return store;
     },
   ],
 ];
@@ -84,5 +101,23 @@ describe('esquema SQL', () => {
     const ddl = SCHEMA_SQL.split(/;\s*\n/).map((x) => x.trim()).filter(Boolean);
     expect(ddl.length).toBeGreaterThanOrEqual(7);
     for (const stmt of ddl) expect(stmt).toMatch(/^CREATE (UNIQUE )?(TABLE|INDEX) IF NOT EXISTS/);
+  });
+});
+
+describe('PostgreSQL real', () => {
+  it('init() es idempotente y soporta JSONB, upsert y cascada', async () => {
+    if (!realPg) return;
+    const store = PgStore.fromUrl(realPg.url);
+    await (store as unknown as { pool: { query(q: string): Promise<unknown> } }).pool.query('DROP SCHEMA public CASCADE; CREATE SCHEMA public;');
+    await store.init();
+    await store.init();
+    await store.saveDebate(rec({ id: 'j1', result: { decision: 'APPROVED', nested: { a: [1, 2] } } as never }));
+    await store.appendEvent('j1', 'x', { k: { deep: true } }, '2026-01-01T00:00:00.000Z');
+    const pool = (store as unknown as { pool: { query(q: string): Promise<{ rows: Record<string, unknown>[] }> } }).pool;
+    expect((await pool.query("SELECT result->'nested'->'a'->>1 AS v FROM debates WHERE id='j1'")).rows[0].v).toBe('2');
+    expect((await store.listEvents('j1'))[0].payload).toEqual({ k: { deep: true } });
+    await pool.query("DELETE FROM debates WHERE id='j1'");
+    expect((await pool.query('SELECT count(*)::int AS n FROM debate_events')).rows[0].n).toBe(0); // ON DELETE CASCADE
+    await store.close();
   });
 });
