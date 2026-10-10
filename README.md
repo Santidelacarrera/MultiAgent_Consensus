@@ -462,6 +462,7 @@ Con `LLM_PROVIDER=claude|ollama`, cada agente pide al modelo (con prompts de **a
 adicionales, contra-argumentos y decisiones de defensa en JSON. La salida del LLM **nunca es de confianza**:
 
 - se valida contra un esquema; ante JSON inválido hay **un reintento** y después se **degrada al análisis estático**;
+- el contenido del PR (título, descripción, diff) va en un bloque `<untrusted_pr>` con el delimitador de cierre neutralizado y el *system prompt* ordena ignorar instrucciones incrustadas (*prompt injection*); aun así, un modelo engañado no puede borrar los hallazgos del análisis estático ni fijar el voto;
 - los hallazgos deben estar anclados al diff (grounding) o se descartan;
 - el riesgo, la postura y el voto se **recalculan** deterministamente por el orquestador.
 

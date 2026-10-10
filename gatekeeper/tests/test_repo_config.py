@@ -24,3 +24,26 @@ def test_missing_or_invalid_config_uses_defaults(make_client, world):
     world.repo_config = "{no es json"
     gh_post(make_client(), "pull_request", pr_payload(action="synchronize"))
     assert "settings" not in submit_body(world)
+
+
+def test_gitlab_reads_config_from_target_branch(make_client, world):
+    import httpx
+
+    from app.config import Settings
+    from app.models import PrRef
+    from app.vcs.gitlab import GitLabClient
+
+    from .conftest import make_settings
+
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["path"], seen["params"] = req.url.raw_path.decode(), dict(req.url.params)
+        return httpx.Response(200, text='{"maxRounds": 2}') if "raw" in seen["path"] else httpx.Response(404)
+
+    client = GitLabClient(make_settings(), transport=httpx.MockTransport(handler))
+    ref = PrRef("gitlab", "grp/proj", 3, base_branch="develop", project_id=42)
+    assert client.get_file(ref, ".consensus.json") == '{"maxRounds": 2}'
+    assert seen["path"].startswith("/api/v4/projects/42/repository/files/.consensus.json/raw") or "%2E" in seen["path"] or ".consensus.json" in seen["path"]
+    assert seen["params"] == {"ref": "develop"}
+    assert GitLabClient(make_settings(), transport=httpx.MockTransport(lambda r: httpx.Response(404))).get_file(ref, "x") is None
