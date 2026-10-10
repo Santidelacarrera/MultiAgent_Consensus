@@ -1,0 +1,299 @@
+import { AgentOptions, BaseAgent, CrossImpact, LineRule } from './base_agent';
+import { FileChange, Finding, PullRequestContext } from './protocol';
+import { DEFAULT_PROFILES } from './scoring';
+
+const isCode = (p: string) => /\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|rb|php|cs|rs|sh)$/i.test(p);
+const isInfra = (p: string) => /\.(tf|tfvars|ya?ml|json|hcl)$/i.test(p) || /Dockerfile|docker-compose/i.test(p);
+const notComment = (l: string) => /^\s*(\/\/|#|\*|\/\*)/.test(l);
+const envRef = /process\.env|os\.environ|getenv|\$\{?[A-Z_]+\}?|<[A-Za-z_ -]+>|changeme|example|placeholder|your[_-]|xxxx|\*{4,}/i;
+
+/** Reglas OWASP Top 10 / vectores de ataque / fugas de datos. */
+const RULES: LineRule[] = [
+  // --- A02/A07: secretos y credenciales en código ---
+  {
+    id: 'aws-key',
+    category: 'secrets',
+    severity: 'critical',
+    confidence: 0.98,
+    title: 'Clave de acceso AWS en el código',
+    description: 'Se añade un identificador AKIA/ASIA de AWS. Cualquier lector del repositorio obtiene acceso a la cuenta.',
+    remediation: 'Revocar y rotar la clave de inmediato; usar roles IAM / OIDC o un gestor de secretos.',
+    pattern: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/,
+  },
+  {
+    id: 'private-key',
+    category: 'secrets',
+    severity: 'critical',
+    confidence: 0.99,
+    title: 'Clave privada en el repositorio',
+    description: 'Se añade un bloque PEM de clave privada.',
+    remediation: 'Eliminar del historial, rotar el par de claves y cargarlo desde un gestor de secretos.',
+    pattern: /-----BEGIN (RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY( BLOCK)?-----/,
+  },
+  {
+    id: 'vendor-token',
+    category: 'secrets',
+    severity: 'critical',
+    confidence: 0.95,
+    title: 'Token de servicio en el código',
+    description: 'Patrón de token de GitHub/Slack/Stripe/Google/Anthropic/OpenAI detectado.',
+    remediation: 'Revocar el token y moverlo a variables de entorno / secret manager.',
+    pattern: /\b(gh[pousr]_[A-Za-z0-9]{36,}|xox[abprs]-[A-Za-z0-9-]{10,}|sk_live_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{35}|sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,})\b/,
+  },
+  {
+    id: 'hardcoded-credential',
+    category: 'secrets',
+    severity: 'high',
+    confidence: 0.6,
+    title: 'Credencial literal asignada en el código',
+    description: 'Variable de tipo password/secret/api_key/token asignada a un literal.',
+    remediation: 'Leer el valor desde el entorno o un gestor de secretos.',
+    pattern: /\b(pass(word|wd)?|secret|api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret)\b\s*[:=]\s*['"][^'"\s]{8,}['"]/i,
+    appliesTo: (p) => isCode(p) || isInfra(p),
+    skip: (l) => notComment(l) || envRef.test(l),
+  },
+  // --- A03: inyección ---
+  {
+    id: 'eval',
+    category: 'injection',
+    severity: 'high',
+    confidence: 0.85,
+    title: 'Ejecución dinámica de código (eval / new Function)',
+    description: 'eval() o new Function() sobre datos dinámicos permite ejecución remota de código.',
+    remediation: 'Sustituir por parseo explícito (JSON.parse, tablas de despacho) o un sandbox verificado.',
+    pattern: /(^|[^\w.])eval\s*\(|new Function\s*\(/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'shell-exec',
+    category: 'injection',
+    severity: 'high',
+    confidence: 0.8,
+    title: 'Ejecución de shell con entrada interpolada',
+    description: 'exec/system/subprocess con shell=True o concatenación permite inyección de comandos.',
+    remediation: 'Usar execFile/spawn con argv separados y listas blancas de argumentos.',
+    pattern: /(child_process\.exec\(|\bexec(Sync)?\(\s*[`'"].*(\$\{|\+)|os\.system\(|subprocess\.[a-z_]+\(.*shell\s*=\s*True)/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'sql-concat',
+    category: 'injection',
+    severity: 'high',
+    confidence: 0.8,
+    title: 'Consulta SQL construida por concatenación/interpolación',
+    description: 'Una sentencia SQL se arma con strings dinámicos (riesgo de inyección SQL, A03).',
+    remediation: 'Usar consultas parametrizadas / ORM con placeholders.',
+    pattern: /\b(SELECT\b.+\bFROM|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b.*(\$\{|["']\s*\+\s*\w|%s|\.format\(|\bf["'])/i,
+    appliesTo: isCode,
+    skip: (l) => notComment(l) || /\$\d+|\?\s*[,)]|:\w+\b.*(params|values)/.test(l),
+  },
+  {
+    id: 'xss-sink',
+    category: 'xss',
+    severity: 'medium',
+    confidence: 0.7,
+    title: 'Sumidero DOM sin sanear (XSS)',
+    description: 'innerHTML / dangerouslySetInnerHTML / document.write con contenido dinámico.',
+    remediation: 'Usar textContent o un sanitizador (DOMPurify) con política estricta.',
+    pattern: /\.innerHTML\s*=|dangerouslySetInnerHTML|document\.write\(/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'path-traversal',
+    category: 'injection',
+    severity: 'medium',
+    confidence: 0.55,
+    title: 'Ruta de fichero construida con entrada de la petición',
+    description: 'path.join/open con req.* / request.* permite path traversal.',
+    remediation: 'Normalizar, validar contra un directorio base y rechazar `..`.',
+    pattern: /(path\.(join|resolve)|readFile(Sync)?|createReadStream|\bopen)\(.*\b(req|request)\.(params|query|body|args|form)/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  // --- A02: criptografía ---
+  {
+    id: 'weak-hash',
+    category: 'crypto',
+    severity: 'medium',
+    confidence: 0.75,
+    title: 'Hash criptográficamente débil (MD5/SHA-1)',
+    description: 'MD5/SHA-1 no son resistentes a colisiones; inadecuados para contraseñas o firmas.',
+    remediation: 'Usar SHA-256+ para integridad y argon2/bcrypt/scrypt para contraseñas.',
+    pattern: /createHash\(\s*['"](md5|sha1)['"]\)|hashlib\.(md5|sha1)\(|MessageDigest\.getInstance\(\s*"(MD5|SHA-1)"/i,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'insecure-random',
+    category: 'crypto',
+    severity: 'medium',
+    confidence: 0.5,
+    title: 'Aleatoriedad no criptográfica para valores sensibles',
+    description: 'Math.random()/random.random() usado para tokens, ids de sesión o contraseñas.',
+    remediation: 'Usar crypto.randomBytes / secrets.token_urlsafe.',
+    pattern: /(token|secret|session|nonce|password|otp)\w*\s*[:=].*(Math\.random\(|random\.random\()/i,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'tls-verify-off',
+    category: 'crypto',
+    severity: 'high',
+    confidence: 0.9,
+    title: 'Verificación TLS deshabilitada',
+    description: 'rejectUnauthorized:false / verify=False / NODE_TLS_REJECT_UNAUTHORIZED=0 habilita MITM.',
+    remediation: 'Mantener la verificación y confiar en la CA correcta mediante un bundle propio.',
+    pattern: /rejectUnauthorized\s*:\s*false|verify\s*=\s*False|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*['"]?0|InsecureSkipVerify\s*:\s*true|curl\s+.*(-k\b|--insecure)/,
+    skip: notComment,
+  },
+  // --- A05: configuración insegura ---
+  {
+    id: 'cors-wildcard',
+    category: 'misconfig',
+    severity: 'medium',
+    confidence: 0.7,
+    title: 'CORS abierto a cualquier origen',
+    description: 'Access-Control-Allow-Origin: * (o origin: "*") junto con credenciales expone la API a cualquier sitio.',
+    remediation: 'Restringir a una lista blanca de orígenes.',
+    pattern: /Access-Control-Allow-Origin['"]?\s*[:,]\s*['"]?\*|origin\s*:\s*['"]\*['"]|allow_origins\s*=\s*\[\s*['"]\*['"]/i,
+    skip: notComment,
+  },
+  {
+    id: 'debug-mode',
+    category: 'misconfig',
+    severity: 'medium',
+    confidence: 0.6,
+    title: 'Modo debug habilitado',
+    description: 'DEBUG=True / app.run(debug=True) expone trazas y consolas interactivas.',
+    remediation: 'Controlar el modo debug por entorno y desactivarlo en producción.',
+    pattern: /\bDEBUG\s*=\s*True\b|\bdebug\s*=\s*True\b/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'open-ingress',
+    category: 'network',
+    severity: 'high',
+    confidence: 0.85,
+    title: 'Red abierta a Internet (0.0.0.0/0) en infraestructura',
+    description: 'Regla de ingreso/ACL abierta a todo Internet.',
+    remediation: 'Restringir CIDRs a rangos conocidos o poner el servicio tras un balanceador/WAF.',
+    pattern: /(cidr_blocks|cidr_ip|source_ranges|CidrIp|cidr)\b.*0\.0\.0\.0\/0|ingress.*0\.0\.0\.0\/0/i,
+    appliesTo: isInfra,
+    skip: notComment,
+  },
+  {
+    id: 'iam-wildcard',
+    category: 'authz',
+    severity: 'high',
+    confidence: 0.85,
+    title: 'Permisos IAM comodín',
+    description: 'Action:"*" o Principal:"*" otorga privilegios excesivos (principio de mínimo privilegio).',
+    remediation: 'Enumerar acciones y recursos concretos.',
+    pattern: /"?(Action|Principal)"?\s*[:=]\s*(\[\s*)?["']\*["']|actions\s*=\s*\[\s*"\*"\s*\]/,
+    appliesTo: isInfra,
+    skip: notComment,
+  },
+  {
+    id: 'privileged-container',
+    category: 'authz',
+    severity: 'high',
+    confidence: 0.85,
+    title: 'Contenedor privilegiado / root / hostNetwork',
+    description: 'privileged:true, runAsUser:0, hostNetwork/hostPID o allowPrivilegeEscalation:true rompen el aislamiento.',
+    remediation: 'Ejecutar como usuario no root, descartar capabilities y evitar acceso al host.',
+    pattern: /privileged\s*:\s*true|runAsUser\s*:\s*0\b|hostNetwork\s*:\s*true|hostPID\s*:\s*true|allowPrivilegeEscalation\s*:\s*true|^\s*USER\s+root\s*$/,
+    appliesTo: isInfra,
+    skip: notComment,
+  },
+  {
+    id: 'public-bucket',
+    category: 'data-leak',
+    severity: 'high',
+    confidence: 0.85,
+    title: 'Almacenamiento con acceso público',
+    description: 'ACL public-read/public-read-write o bloqueo de acceso público deshabilitado.',
+    remediation: 'Mantener block_public_access y servir mediante URLs firmadas/CDN con OAC.',
+    pattern: /acl\s*=\s*["']public-read(-write)?["']|block_public_(acls|policy)\s*=\s*false|restrict_public_buckets\s*=\s*false|publicAccess.*(Blob|Container)/i,
+    appliesTo: isInfra,
+    skip: notComment,
+  },
+  // --- A08: deserialización ---
+  {
+    id: 'unsafe-deserialization',
+    category: 'deserialization',
+    severity: 'high',
+    confidence: 0.8,
+    title: 'Deserialización insegura',
+    description: 'pickle.loads / yaml.load sin SafeLoader / unserialize / ObjectInputStream sobre datos no confiables.',
+    remediation: 'Usar formatos de datos puros (JSON) o yaml.safe_load.',
+    pattern: /pickle\.loads?\(|yaml\.load\((?![^)]*Safe)|\bunserialize\(|new ObjectInputStream\(|marshal\.loads\(/,
+    appliesTo: isCode,
+    skip: (l) => notComment(l) || /SafeLoader|safe_load/.test(l),
+  },
+  // --- A09: fuga de datos por logging ---
+  {
+    id: 'log-sensitive',
+    category: 'data-leak',
+    severity: 'medium',
+    confidence: 0.65,
+    title: 'Datos sensibles escritos en logs',
+    description: 'Se registra password/token/secret/tarjeta/ssn en logs.',
+    remediation: 'Enmascarar o excluir campos sensibles antes de registrar.',
+    pattern: /(console\.(log|info|debug|error)|logger?\.(info|debug|warn|error)|logging\.(info|debug|warning|error)|print)\s*\(.*\b(password|passwd|token|secret|api[_-]?key|authorization|credit[_-]?card|ssn|cvv)\b/i,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+  {
+    id: 'sensitive-url-log',
+    category: 'data-leak',
+    severity: 'low',
+    confidence: 0.4,
+    title: 'Posible fuga de PII en trazas de error',
+    description: 'Se vuelca el objeto completo de la petición/usuario en una traza.',
+    remediation: 'Registrar únicamente identificadores no sensibles.',
+    pattern: /(console\.(log|error)|logger\.\w+|print)\(\s*(JSON\.stringify\()?\s*(req|request|user|customer)\s*[,)]/,
+    appliesTo: isCode,
+    skip: notComment,
+  },
+];
+
+export class RedTeamAgent extends BaseAgent {
+  readonly id = 'red_team' as const;
+  readonly displayName = 'Red Team';
+  protected readonly mandate =
+    'Eres el agente RED TEAM de un comité de gobernanza de PRs. Tu incentivo es DETENER cambios que introduzcan vulnerabilidades OWASP Top 10, vectores de ataque, escalada de privilegios o fugas de datos. Eres adversarial: asume atacante competente. Sólo reportas riesgos demostrables en el diff.';
+
+  constructor(opts: AgentOptions = {}) {
+    super(opts, DEFAULT_PROFILES.red_team);
+  }
+
+  protected analyze(files: FileChange[], _pr: PullRequestContext): Finding[] {
+    return this.applyLineRules(RULES, files);
+  }
+
+  protected crossImpact(f: Finding): CrossImpact | null {
+    if (f.agent === 'business_ops' && ['slo-risk', 'destructive-migration', 'availability'].includes(f.category)) {
+      return {
+        category: 'availability',
+        severity: 'medium',
+        title: `Superficie de DoS/integridad: ${f.title}`,
+        description: `Red Team corrobora: "${f.title}" degrada disponibilidad/integridad (tríada CIA) y amplía la superficie de ataque por denegación de servicio.`,
+        remediation: 'Reforzar resiliencia (probes, límites, reversibilidad) antes de desplegar.',
+      };
+    }
+    if (f.agent === 'architect' && f.category === 'layering') {
+      return {
+        category: 'attack-surface',
+        severity: 'low',
+        title: `Acoplamiento que amplía la superficie: ${f.title}`,
+        description: 'Red Team corrobora: el dominio acoplado a infraestructura dificulta aislar y validar entradas en un único punto.',
+        remediation: 'Introducir puertos/adaptadores y validar entradas en el borde.',
+      };
+    }
+    return null;
+  }
+}
