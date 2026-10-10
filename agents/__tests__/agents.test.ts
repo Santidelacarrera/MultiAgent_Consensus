@@ -253,3 +253,23 @@ describe('protocolo de debate por agente', () => {
     expect(rev.stance).toBeGreaterThan(bizReview.stance);
   });
 });
+
+describe('RedTeamAgent — CI/CD y cadena de suministro', () => {
+  const agent = new RedTeamAgent();
+  const wf = '.github/workflows/ci.yml';
+
+  it('detecta pull_request_target, inyección de script y acciones sin fijar', async () => {
+    const pr = makePr([{ path: wf, isNew: true, added: ['on:', '  pull_request_target:', 'jobs:', '  b:', '    steps:', '      - uses: some-org/action@main', '      - run: echo "${{ github.event.pull_request.title }}"'] }]);
+    expect(ids((await agent.position(pr)).findings).sort()).toEqual(['ci-pr-target', 'ci-script-injection', 'ci-unpinned-action']);
+  });
+
+  it('no marca el patrón seguro (valor vía env) ni acciones fijadas por SHA o versión', async () => {
+    const pr = makePr([{ path: wf, isNew: true, added: ['on: pull_request', '    steps:', `      - uses: actions/checkout@${'a'.repeat(40)}`, '      - uses: actions/setup-node@v4', '        env:', '          TITLE: ${{ github.event.pull_request.title }}', '      - run: echo "$TITLE"'] }]);
+    expect((await agent.position(pr)).findings).toHaveLength(0);
+  });
+
+  it('detecta curl | sh y ADD remoto', async () => {
+    const pr = makePr([{ path: 'Dockerfile', isNew: true, added: ['FROM node:22', 'RUN curl -fsSL https://x.sh/install | sudo bash', 'ADD https://example.com/app.tar.gz /opt/'] }]);
+    expect(ids((await agent.position(pr)).findings).sort()).toEqual(['docker-add-remote', 'pipe-to-shell']);
+  });
+});

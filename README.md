@@ -293,7 +293,7 @@ opcional**. Los hallazgos sólo cuentan si están anclados al diff.
 
 | Agente | Qué busca | Ejemplos de reglas |
 |--------|-----------|--------------------|
-| `red_team.ts` | OWASP Top 10, vectores de ataque, fugas de datos | Claves AWS / tokens / claves privadas (crítico), credenciales literales, `eval`, inyección de shell/SQL, XSS, deserialización insegura, MD5/SHA-1, TLS desactivado, CORS `*`, `0.0.0.0/0`, IAM `*`, contenedores privilegiados, buckets públicos, secretos en logs |
+| `red_team.ts` | OWASP Top 10, vectores de ataque, fugas de datos | Claves AWS / tokens / claves privadas (crítico), credenciales literales, `eval`, inyección de shell/SQL, XSS, deserialización insegura, MD5/SHA-1, TLS desactivado, CORS `*`, `0.0.0.0/0`, IAM `*`, contenedores privilegiados, buckets públicos, secretos en logs, **CI/CD y cadena de suministro** (`pull_request_target`, inyección de script en workflows, acciones sin fijar, `curl \| sh`, `ADD` remoto) |
 | `architect.ts` | Mantenibilidad, SOLID, deuda técnica | Funciones largas y complejidad ciclomática (SRP), clases "dios", dominio acoplado a infraestructura (DIP), cadenas `instanceof` (OCP), código duplicado (DRY), eliminación de API pública, supresiones de linter, TODO/FIXME, PR gigante, cambios sin tests |
 | `business_ops.ts` | Coste, SLA/SLO, impacto financiero | Delta de coste mensual estimado en IaC (instancias EC2/RDS, réplicas, almacenamiento, IOPS, NAT, EKS…) frente al presupuesto; migraciones destructivas (`DROP`, `TRUNCATE`, `DELETE` sin `WHERE`), `CREATE INDEX` bloqueante, `NOT NULL` sin `DEFAULT`; probes/PDB/límites/alertas eliminados; imagen `latest`, estrategia `Recreate`, `maxUnavailable: 100%`, una réplica en prod |
 
