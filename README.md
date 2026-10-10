@@ -317,6 +317,7 @@ El orquestador es el **coordinador de confianza**; los agentes (y su capa LLM) *
 | Subir severidad / escalar tarde           | En `revise` no se puede subir la severidad de un hallazgo previo; los hallazgos tardíos se acotan a `medium`.    |
 | Equivocación (dos respuestas distintas)   | La primera cuenta; una segunda respuesta válida pero distinta ⇒ `equivocation` ⇒ expulsión.                      |
 | Amplificación entre agentes               | Los ecos entre dominios (`corroborate`) se acotan a `medium`; la influencia social no levanta un disenso bloqueante. |
+| Fuga de secretos vía la propia minuta     | Claves, tokens y credenciales detectados se **enmascaran** (`[REDACTADO]`) antes de publicarse en el comentario del PR. |
 | Contenido hostil en la minuta             | Títulos, snippets y argumentos se **escapan** (sin HTML activo ni menciones `@`).                                |
 | Resultado inconsistente del orquestador   | El gatekeeper **revalida** (quórum, vetos, disenso) y **falla cerrado** (`failure`/`error`).                     |
 
@@ -375,6 +376,7 @@ Autenticación: cabecera `x-api-key: $ORCHESTRATOR_API_KEY` (o `Authorization: B
 | GET    | `/v1/debates/:id/events`          | Log ordenado del debate (persistido).                                           |
 | GET    | `/v1/debates/:id/metrics`         | Convergencia por ronda.                                                         |
 | GET    | `/v1/debates?prId=github:o/r#7`   | Histórico de debates de un PR.                                                  |
+| GET    | `/metrics`                        | Métricas Prometheus (debates por decisión, expulsiones por tipo, rondas, convergencia media, activos/en cola). |
 | POST   | `/v1/debates/:id/resolution`      | Resolución humana `{reviewer, decision: approve\|reject, rationale}` (sólo si `escalated`). |
 
 Cuerpo de `POST /v1/debates`:
@@ -409,6 +411,7 @@ Variables del **orquestador**:
 | `BUS_SECRET` | — (obligatorio en producción) | Deriva las claves HMAC de los agentes |
 | `ORCHESTRATOR_API_KEY` | — | Si se define, protege `/v1/*` |
 | `MAX_ROUNDS` | `3` | Rondas antes de escalar |
+| `MAX_CONCURRENT_DEBATES` | `4` | Debates simultáneos; el resto espera en cola |
 | `VETO_ON_CRITICAL` | `true` | Un hallazgo crítico verificado veta el merge |
 | `MONTHLY_BUDGET_USD` | `1000` | Umbral de incremento de coste (FinOps) |
 | `AGENT_TIMEOUT_MS` | `120000` | Timeout por petición a un agente |

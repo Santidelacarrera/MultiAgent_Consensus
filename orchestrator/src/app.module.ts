@@ -9,6 +9,7 @@ import { MemoryBus } from './bus/memory_bus';
 import { RedisStreamsBus } from './bus/redis_bus';
 import { AppConfig, loadConfig } from './config';
 import { DebateService } from './debate/debate_service';
+import { Metrics } from './debate/metrics';
 import { MemoryStore } from './store/memory_store';
 import { PgStore } from './store/pg_store';
 import { DebateStore, STORE } from './store/store';
@@ -57,6 +58,7 @@ export class AppModule {
         ApiKeyGuard,
         AgentRuntime,
         DebateService,
+        Metrics,
         { provide: Lifecycle, useFactory: (bus: EventBus, store: DebateStore) => new Lifecycle(bus, store, owns), inject: [EVENT_BUS, STORE] },
       ],
     };

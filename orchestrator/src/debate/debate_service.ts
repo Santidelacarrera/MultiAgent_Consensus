@@ -7,6 +7,7 @@ import { DebateStore, STORE } from '../store/store';
 import { DebateRecord, DebateResult, DebateStatus, HumanResolution, StoredEvent } from '../types';
 import { CONFIG } from '../tokens';
 import { DebateEngine } from './debate_engine';
+import { Metrics } from './metrics';
 import { renderMinutes } from './minutes';
 
 export class NotFoundError extends Error {}
@@ -21,7 +22,27 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
     @Inject(CONFIG) private readonly config: AppConfig,
     @Inject(EVENT_BUS) private readonly bus: EventBus,
     @Inject(STORE) private readonly store: DebateStore,
+    private readonly counters: Metrics,
   ) {}
+
+  private slots = 0;
+  private readonly waiters: (() => void)[] = [];
+
+  private async acquire(): Promise<void> {
+    if (this.slots < this.config.maxConcurrentDebates) {
+      this.slots++;
+      return;
+    }
+    this.counters.debateQueued(1);
+    await new Promise<void>((r) => this.waiters.push(r));
+    this.counters.debateQueued(-1);
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next(); // el hueco pasa directamente al siguiente
+    else this.slots--;
+  }
 
   /** Debates que quedaron "running" por un reinicio se marcan como error (el gatekeeper falla cerrado y puede reenviar). */
   async onModuleInit(): Promise<void> {
@@ -70,8 +91,20 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
   }
 
   private async execute(rec: DebateRecord, pr: PullRequestContext): Promise<DebateRecord> {
+    await this.acquire();
+    this.counters.debateRunning(1);
+    try {
+      return await this.executeNow(rec, pr);
+    } finally {
+      this.counters.debateRunning(-1);
+      this.release();
+    }
+  }
+
+  private async executeNow(rec: DebateRecord, pr: PullRequestContext): Promise<DebateRecord> {
     const emit = async (type: string, payload: Record<string, unknown>) => {
       const at = new Date().toISOString();
+      if (type === 'agent.fault') this.counters.fault(String(payload.kind));
       await this.store.appendEvent(rec.id, type, payload, at);
       if (type === 'round.evaluated') {
         await this.store.saveMetric({
@@ -107,11 +140,13 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
         finishedAt: result.finishedAt,
       };
       await this.store.saveDebate(done);
+      this.counters.debateFinished(result.decision, result.rounds.length, result.convergence.final);
       return done;
     } catch (e) {
       await this.expireStreams(rec.id);
       const failed: DebateRecord = { ...rec, status: 'error', reason: `Error del orquestador: ${(e as Error).message}`, finishedAt: new Date().toISOString() };
       await this.store.saveDebate(failed);
+      this.counters.debateFinished('ERROR', 0, 0);
       await this.store.appendEvent(rec.id, 'debate.error', { message: (e as Error).message }, failed.finishedAt!);
       return failed;
     }

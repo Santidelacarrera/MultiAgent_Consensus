@@ -1,5 +1,6 @@
 import { AgentId, Finding, Severity, Vote } from '../../../agents/protocol';
 import { DebateResult } from '../types';
+import { redactSecrets } from './redact';
 
 const AGENT_LABEL: Record<AgentId, string> = {
   red_team: 'Red Team',
@@ -15,7 +16,7 @@ const SEV_ICON: Record<Severity, string> = { critical: '🔴', high: '🟠', med
 
 /** Escapa texto no confiable (títulos de PR, snippets, argumentos de LLM) para Markdown de GitHub/GitLab. */
 export function esc(s: string): string {
-  return String(s)
+  return redactSecrets(String(s))
     .replace(/\r?\n+/g, ' ')
     .replace(/[\\`*_{}[\]<>|#~]/g, (m) => `\\${m}`)
     .replace(/@/g, '@​')
@@ -23,7 +24,7 @@ export function esc(s: string): string {
 }
 
 export function code(s: string): string {
-  const text = String(s).replace(/\r?\n+/g, ' ').slice(0, 200);
+  const text = redactSecrets(String(s)).replace(/\r?\n+/g, ' ').slice(0, 200);
   const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((m) => m.length));
   const fence = '`'.repeat(longest + 1);
   return `${fence} ${text.replace(/@/g, '@​')} ${fence}`;
