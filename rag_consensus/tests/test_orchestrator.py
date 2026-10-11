@@ -186,3 +186,31 @@ def test_self_contradicting_draft_is_blocked_end_to_end() -> None:
     out = run(orchestrator_for(lambda r: httpx.Response(200, json=body)).answer(REQUEST))
     assert out.verdict is Verdict.REJECTED and out.answer is None
     assert any(r.startswith("BELOW_MIN:coherence_validator") for r in out.decision.reasons)
+
+
+def test_audit_record_carries_tenant_and_engine_correlation() -> None:
+    from rag_consensus import InMemoryAuditSink
+
+    sink = InMemoryAuditSink()
+    ok_client, _ = make_client(lambda r: httpx.Response(200, json=rag_body(), headers={"X-Request-Id": "req-ok"}))
+    run(ConsensusOrchestrator(ok_client, audit=sink).answer(REQUEST))
+    err_client, _ = make_client(lambda r: httpx.Response(503, json={"error": "database_unavailable"}, headers={"X-Request-Id": "req-err"}), max_retries=0)
+    run(ConsensusOrchestrator(err_client, audit=sink).answer(REQUEST))
+
+    approved, failed = sink.records
+    assert (approved.tenant_id, approved.engine_request_id, approved.engine_error, approved.engine_http_status) == (TENANT, "req-ok", None, None)
+    assert (failed.tenant_id, failed.engine_request_id, failed.engine_error, failed.engine_http_status, failed.error_code) == (TENANT, "req-err", "database_unavailable", 503, "RAG_HTTP")
+    payload = json.loads(failed.to_json())
+    assert payload["tenant_id"] == TENANT and payload["engine"] == {"request_id": "req-err", "error": "database_unavailable", "http_status": 503}
+
+
+def test_failing_audit_sink_withholds_the_answer() -> None:
+    from rag_consensus import AuditRecord
+
+    class Broken:
+        def emit(self, record: AuditRecord) -> None:
+            raise OSError("disco lleno")
+
+    client, _ = make_client(lambda r: httpx.Response(200, json=rag_body()))
+    out = run(ConsensusOrchestrator(client, audit=Broken()).answer(REQUEST))
+    assert out.verdict is Verdict.REJECTED and out.answer is None and out.error_code == "AUDIT_FAILED" and "AUDIT_FAILED" in out.decision.reasons

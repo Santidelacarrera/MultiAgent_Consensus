@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 from types import TracebackType
 from typing import Awaitable, Callable, Mapping, Protocol
 
@@ -35,6 +36,8 @@ log = logging.getLogger("rag_consensus.client")
 _RETRYABLE_STATUS = frozenset({429, 502, 503, 504})
 _MAX_CHUNKS = 200
 _MAX_RETRY_AFTER_S = 5.0
+_SAFE_ID = re.compile(r"^[A-Za-z0-9._:\-]{1,64}$")
+_SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -102,12 +105,12 @@ class RagClient:
                 if resp.status_code < 300:
                     return resp
                 if resp.status_code not in _RETRYABLE_STATUS:
-                    raise RagHttpError(resp.status_code)  # 4xx/5xx no reintentables: no se filtra el cuerpo
+                    raise _http_error(resp)  # 4xx/5xx no reintentables: no se filtra el cuerpo
                 last_timeout = False
                 retry_after = _retry_after(resp.headers)
                 log.warning("rag HTTP %d (intento %d/%d)", resp.status_code, attempt + 1, attempts)
                 if attempt == attempts - 1:
-                    raise RagHttpError(resp.status_code, "reintentos agotados")
+                    raise _http_error(resp, "reintentos agotados")
             if attempt < attempts - 1:
                 await self._sleep(retry_after if retry_after is not None else cfg.backoff_s * (2**attempt))
         if last_timeout:
@@ -148,6 +151,7 @@ class RagClient:
             tenant_id=tenant,
             status=str(status),
             synthesized_abstention=synthesized,
+            engine_request_id=_request_id(resp.headers),
         )
 
 
@@ -176,6 +180,24 @@ def _parse_fragment(raw: object, position: int, tenant: str) -> Chunk:
         source=source,
         metadata={"index": index, "doc_id": doc_id, "section": section, "page": raw.get("page"), "start": raw.get("start"), "end": raw.get("end"), "tenant_source": "response"},
     )
+
+
+def _request_id(headers: Mapping[str, str]) -> str | None:
+    value = headers.get("x-request-id")
+    return value if value is not None and _SAFE_ID.fullmatch(value) else None
+
+
+def _http_error(resp: httpx.Response, message: str = "") -> RagHttpError:
+    """Error HTTP con el id de petición del motor y su código de error (sólo si son identificadores seguros)."""
+    code: str | None = None
+    try:
+        body = json.loads(resp.content[:4096])
+        candidate = body.get("error") if isinstance(body, dict) else None
+        if isinstance(candidate, str) and _SAFE_CODE.fullmatch(candidate):
+            code = candidate
+    except ValueError:
+        pass
+    return RagHttpError(resp.status_code, message, engine_request_id=_request_id(resp.headers), engine_error=code)
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:

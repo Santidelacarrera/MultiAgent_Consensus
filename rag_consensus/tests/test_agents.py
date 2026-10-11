@@ -164,3 +164,15 @@ def test_low_retrieval_scores_are_flagged_only_when_a_floor_is_configured() -> N
 
 def test_tenant_constant_matches_fixture() -> None:
     assert TENANT == REQUEST.tenant_id
+
+
+def test_number_present_elsewhere_in_the_context_does_not_launder_a_swapped_figure() -> None:
+    """Caso real del motor: el fragmento devuelto contiene toda la sección y «90» figura en OTRA frase (retención de accesos)."""
+    full = chunk(text=POLICY_TEXT + " Los registros de auditoría se conservan durante 7 años. Los registros de acceso se eliminan a los 90 días.")
+    swapped = assess(HallucinationCritic(), response("El plazo de devolución de los pedidos es de 90 días desde la entrega. [1]", chunks=(full,)))
+    assert "NUMBER_CONTEXT_MISMATCH" in codes(swapped) and "UNSUPPORTED_NUMBER" not in codes(swapped)
+    assert swapped.score < 0.75
+    honest = assess(HallucinationCritic(), response("El plazo de devolución de los pedidos es de 30 días desde la entrega. [1]", chunks=(full,)))
+    assert "NUMBER_CONTEXT_MISMATCH" not in codes(honest) and honest.score >= 0.9
+    right_elsewhere = assess(HallucinationCritic(), response("Los registros de acceso se eliminan a los 90 días. [1]", chunks=(full,)))
+    assert "NUMBER_CONTEXT_MISMATCH" not in codes(right_elsewhere) and right_elsewhere.score >= 0.9

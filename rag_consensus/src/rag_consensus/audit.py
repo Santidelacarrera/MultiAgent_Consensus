@@ -31,6 +31,10 @@ class AuditRecord:
     chunk_count: int
     chunk_ids: tuple[str, ...]
     timestamp: str
+    #: Correlación con ContextRAG_Engine: `X-Request-Id` de su respuesta y, si falló, su código de error / estado HTTP.
+    engine_request_id: str | None = None
+    engine_error: str | None = None
+    engine_http_status: int | None = None
 
     def to_json(self) -> str:
         return json.dumps(
@@ -46,6 +50,7 @@ class AuditRecord:
                 "chunk_count": self.chunk_count,
                 "chunk_ids": list(self.chunk_ids),
                 "timestamp": self.timestamp,
+                "engine": {"request_id": self.engine_request_id, "error": self.engine_error, "http_status": self.engine_http_status},
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -59,6 +64,9 @@ def build_record(
     decision: ConsensusDecision,
     error_code: str | None,
     chunk_ids: tuple[str, ...],
+    engine_request_id: str | None = None,
+    engine_error: str | None = None,
+    engine_http_status: int | None = None,
 ) -> AuditRecord:
     return AuditRecord(
         request_id=request_id,
@@ -71,6 +79,9 @@ def build_record(
         chunk_count=len(chunk_ids),
         chunk_ids=chunk_ids[:50],
         timestamp=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        engine_request_id=engine_request_id,
+        engine_error=engine_error,
+        engine_http_status=engine_http_status,
     )
 
 
