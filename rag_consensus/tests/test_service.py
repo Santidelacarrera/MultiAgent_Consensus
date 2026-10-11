@@ -76,7 +76,8 @@ def signed(client: TestClient, method: str, path: str, body: dict[str, Any] | No
     stamp = str(ts if ts is not None else int(time.time()))
     headers = {"x-tenant-id": tenant, "x-request-id": rid, "x-guard-timestamp": stamp,
                "x-guard-signature": guard.sign(key, tenant, rid, stamp, method, path, payload), "content-type": "application/json"}
-    return client.request(method, path, content=payload, headers=headers)
+    resp: Resp = client.request(method, path, content=payload, headers=headers)
+    return resp
 
 
 # ------------------------------------------------------------------ firma del guard
@@ -302,7 +303,8 @@ def review(client: TestClient, body: dict[str, Any], *, tenant: str | None = "ac
         headers["authorization"] = f"Bearer {token}"
     if tenant is not None:
         headers["x-tenant-id"] = tenant
-    return client.post("/v1/consensus", json=body, headers=headers)
+    resp: Resp = client.post("/v1/consensus", json=body, headers=headers)
+    return resp
 
 
 def test_review_contract_for_nexusflow_approved_and_rejected() -> None:
