@@ -40,3 +40,17 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker compose --env-file .env.example config --quiet
       - run: docker compose --env-file .env.example build
+
+  rag-consensus:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rag_consensus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: python -m mypy --strict src tests
+      - run: python -m pytest -q
