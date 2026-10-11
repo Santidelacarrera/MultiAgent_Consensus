@@ -3,6 +3,8 @@ import request from 'supertest';
 import { CLEAN_PR, FAKE_AWS_KEY, makePr } from '../../agents/__tests__/fixtures';
 import { AppModule } from '../src/app.module';
 import { MemoryBus } from '../src/bus/memory_bus';
+import { ScriptedProvider } from '../../agents/llm';
+import { Metrics } from '../src/debate/metrics';
 import { redactSecrets } from '../src/debate/redact';
 import { renderMinutes } from '../src/debate/minutes';
 import { MemoryStore } from '../src/store/memory_store';
@@ -53,4 +55,66 @@ describe('concurrencia y métricas', () => {
     expect(m.text).toContain('consensus_debates_queued 0');
     await app.close();
   });
+});
+
+describe('carga', () => {
+  // Latencia por llamada al LLM simulado: fuerza a que los debates se solapen y se forme cola.
+  const slowLlm = new ScriptedProvider(async () => {
+    await new Promise((r) => setTimeout(r, 40));
+    return JSON.stringify({ findings: [] });
+  });
+
+  it('24 debates con límite 3: todos terminan y nunca hay más de 3 activos a la vez', async () => {
+    const mod = await Test.createTestingModule({
+      imports: [AppModule.register({ busBackend: 'memory', busSecret: 's', maxConcurrentDebates: 3 }, { bus: new MemoryBus(), store: new MemoryStore(), llm: slowLlm })],
+    }).compile();
+    const app = mod.createNestApplication();
+    await app.init();
+    const metrics = app.get(Metrics);
+    const read = (name: string) => Number(new RegExp(`${name} (\\d+)`).exec(metrics.render())![1]);
+    // Se registra el máximo exacto interceptando los contadores (el muestreo por timers se ve privado de CPU).
+    let active = 0;
+    let queued = 0;
+    let maxActive = 0;
+    let maxQueued = 0;
+    const origRun = metrics.debateRunning.bind(metrics);
+    const origQueue = metrics.debateQueued.bind(metrics);
+    metrics.debateRunning = (d: number) => {
+      active += d;
+      maxActive = Math.max(maxActive, active);
+      origRun(d);
+    };
+    metrics.debateQueued = (d: number) => {
+      queued += d;
+      maxQueued = Math.max(maxQueued, queued);
+      origQueue(d);
+    };
+    try {
+      const http = request(app.getHttpServer());
+      const diffs = [
+        CLEAN_PR().diff, // aprobado (1 ronda)
+        makePr([{ path: 'src/c.ts', added: [`export const K = "${FAKE_AWS_KEY}";`] }, { path: 'src/c.test.ts', added: ['t'] }]).diff, // rechazado (veto)
+        makePr([{ path: 'src/db.ts', added: ['const q = `SELECT * FROM u WHERE id = ${req.params.id}`;'] }, { path: 'src/db.test.ts', added: ['t'] }]).diff, // escalado
+      ];
+      const ids = await Promise.all(
+        Array.from({ length: 24 }, (_, i) =>
+          http
+            .post('/v1/debates')
+            .send({ pr: { provider: 'github', repo: 'acme/shop', number: i + 1, title: 't', headSha: `abc${String(i + 1).padStart(4, '0')}`, diff: diffs[i % 3] } })
+            .expect(202)
+            .then((r) => r.body.id as string),
+        ),
+      );
+      const results = await Promise.all(ids.map((id) => http.get(`/v1/debates/${id}?waitMs=60000`).then((r) => r.body.status as string)));
+      const count = (st: string) => results.filter((x) => x === st).length;
+      expect([count('approved'), count('rejected'), count('escalated')]).toEqual([8, 8, 8]);
+      expect(maxActive).toBeGreaterThan(0);
+      expect(maxActive).toBeLessThanOrEqual(3);
+      expect(maxQueued).toBeGreaterThan(0); // la cola se usó de verdad
+      expect(read('consensus_debates_queued')).toBe(0);
+      expect(read('consensus_debates_active')).toBe(0);
+    } finally {
+      await app.close();
+    }
+  }, 90000);
 });

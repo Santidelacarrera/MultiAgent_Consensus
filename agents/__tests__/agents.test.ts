@@ -273,3 +273,35 @@ describe('RedTeamAgent — CI/CD y cadena de suministro', () => {
     expect(ids((await agent.position(pr)).findings).sort()).toEqual(['docker-add-remote', 'pipe-to-shell']);
   });
 });
+
+describe('RedTeamAgent — Kubernetes, Go/Java y dependencias', () => {
+  const agent = new RedTeamAgent();
+
+  it('detecta hostPath/docker.sock y secretos literales en manifiestos', async () => {
+    const pr = makePr([{ path: 'k8s/app.yaml', isNew: true, added: ['      volumes:', '        - name: dock', '          hostPath:', '            path: /var/run/docker.sock', '      env:', '        - name: DB_PASSWORD', '          value: "SuperSecret123"'.replace(/^/, ''), '        - { name: API_TOKEN, value: "abcdef123456" }'] }]);
+    const found = ids((await agent.position(pr)).findings);
+    expect(found).toContain('k8s-hostpath');
+    expect(found).toContain('k8s-inline-secret');
+  });
+
+  it('no marca valueFrom/secretKeyRef ni referencias a variables', async () => {
+    const pr = makePr([{ path: 'k8s/app.yaml', isNew: true, added: ['      env:', '        - name: DB_PASSWORD', '          valueFrom:', '            secretKeyRef: { name: db, key: pw }', '        - name: API_TOKEN', '          value: "${API_TOKEN}"'] }]);
+    expect(ids((await agent.position(pr)).findings)).not.toContain('k8s-inline-secret');
+  });
+
+  it('detecta shell en Go, Runtime.exec en Java y chmod 777', async () => {
+    const pr = makePr([
+      { path: 'cmd/run.go', isNew: true, added: ['out, _ := exec.Command("sh", "-c", "ls "+dir).Output()'] },
+      { path: 'src/Run.java', isNew: true, added: ['Runtime.getRuntime().exec("ls " + dir);'] },
+      { path: 'scripts/setup.sh', isNew: true, added: ['chmod -R 777 /srv/data'] },
+    ]);
+    expect(ids((await agent.position(pr)).findings).sort()).toEqual(['chmod-777', 'go-shell', 'java-runtime-exec']);
+  });
+
+  it('detecta scripts de instalación y dependencias por URL, pero no versiones ni commits fijados', async () => {
+    const pr = makePr([{ path: 'package.json', added: ['  "scripts": {', '    "postinstall": "node setup.js"', '  },', '  "dependencies": {', '    "evil": "https://example.com/evil.tgz",', '    "ok": "^1.2.3",', '    "pinned": "git+https://github.com/a/b.git#0123456789abcdef0123456789abcdef01234567"', '  }'] }]);
+    const f = await agent.position(pr);
+    expect(ids(f.findings).sort()).toEqual(['dep-from-url', 'npm-install-script']);
+    expect(f.findings.find((x) => x.id.includes('dep-from-url'))!.evidence).toHaveLength(1);
+  });
+});
