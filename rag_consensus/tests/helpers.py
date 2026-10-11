@@ -28,14 +28,27 @@ def response(draft: str = "El plazo de devolución de los pedidos es de 30 días
     return RetrievalResponse(draft_answer=draft, chunks=(chunk(),) if chunks is None else chunks, tenant_id=tenant)
 
 
-def rag_body(draft: str = "El plazo de devolución de los pedidos es de 30 días desde la entrega.", chunks: list[dict[str, Any]] | None = None, tenant: str | None = TENANT) -> dict[str, Any]:
-    body: dict[str, Any] = {
+def fragment(index: int = 1, text: str = POLICY_TEXT, doc_id: str = "politicas.md", score: float = 0.9) -> dict[str, Any]:
+    return {"index": index, "score": score, "doc_id": doc_id, "source": doc_id, "section": "Devoluciones", "page": None, "start": 0, "end": len(text), "text": text}
+
+
+def rag_body(
+    draft: str | None = "El plazo de devolución de los pedidos es de 30 días desde la entrega. [1]",
+    fragments: list[dict[str, Any]] | None = None,
+    tenant: str = TENANT,
+    status: str = "ok",
+) -> dict[str, Any]:
+    """Respuesta con la forma REAL de POST /api/v1/retrieve de ContextRAG_Engine."""
+    frs = [fragment()] if fragments is None else fragments
+    return {
+        "status": status if frs else "no_results",
+        "tenant_id": tenant,
+        "query": REQUEST.query,
+        "fragments": frs,
         "draft_answer": draft,
-        "chunks": chunks if chunks is not None else [{"id": "c1", "text": POLICY_TEXT, "score": 0.9, "tenant_id": TENANT, "source": "politicas.md"}],
+        "draft_verified": False,
+        "latency_ms": 3.2,
     }
-    if tenant is not None:
-        body["tenant_id"] = tenant
-    return body
 
 
 Handler = Callable[[httpx.Request], httpx.Response]

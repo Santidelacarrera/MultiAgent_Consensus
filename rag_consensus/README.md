@@ -27,10 +27,10 @@ import asyncio
 from rag_consensus import ConsensusOrchestrator, RagClient, RagClientConfig, RetrievalRequest
 
 async def main() -> None:
-    config = RagClientConfig(base_url="https://context-rag.internal", api_key="…", retrieve_path="/v1/retrieve")
+    config = RagClientConfig(base_url="https://context-rag.internal", api_key="…")   # POST /api/v1/retrieve
     async with RagClient(config) as client:
         orchestrator = ConsensusOrchestrator(client)
-        out = await orchestrator.answer(RetrievalRequest(tenant_id="acme", query="¿Plazo de devolución?", top_k=5))
+        out = await orchestrator.answer(RetrievalRequest(tenant_id="acme", query="¿Plazo de devolución?", top_k=5))   # top_k ≤ 20
     if out.approved:
         print(out.answer, out.citations)
     else:
@@ -39,29 +39,41 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-## Contrato asumido con ContextRAG_Engine
+## Contrato con ContextRAG_Engine
 
-> Este repositorio no tiene acceso al código de `ContextRAG_Engine`: el contrato es una **suposición explícita**
-> y está centralizado en `client.py` (`_parse`, `_parse_chunk`). Si el endpoint real difiere, es el único sitio a adaptar.
+Verificado contra el código del servicio (`contextrag/api/retrieval.py`, commit `83869d8`) **y contra una instancia real**
+en la suite E2E. Todo el contrato vive en `client.py` (docstring, `_parse`, `_parse_fragment`).
 
 ```
-POST {base_url}{retrieve_path}                 (por defecto /v1/retrieve)
-  { "tenant_id": str, "query": str, "top_k": int, "filters"?: {...}, "min_score"?: float }
-→ { "tenant_id"?: str,
-    "draft_answer": str,                        (alias: "answer")
-    "chunks": [ { "id": str, "text": str, "score": number, "tenant_id"?: str,
-                  "source"?: str, "metadata"?: {...} } ] }      (alias: "chunk_id", "content")
+POST {base_url}/api/v1/retrieve                            (retrieve_path = DEFAULT_RETRIEVE_PATH)
+Cabeceras:  X-API-Key: <clave ligada a un tenant>      X-Tenant: <tenant_id>
+Cuerpo:     {"tenant_id": str, "query": str (1..4000), "top_k": int (1..20)}      ← el servicio usa extra="forbid"
+200 →       {"status": "ok" | "no_results", "tenant_id": str, "query": str,
+             "fragments": [{"index": int≥1, "score": float, "doc_id": str, "source": str, "section": str,
+                            "page": int|null, "start": int, "end": int, "text": str}],
+             "draft_answer": str | null,  "draft_verified": false,  "latency_ms": float}
+Errores:    401 clave inválida · 403 tenant ≠ tenant de la clave · 422 cuerpo inválido · 429 límite · 503 BD de auditoría caída
 ```
 
-Cualquier desviación (JSON inválido, tipos erróneos, >200 fragmentos, >2 MB) ⇒ `RagProtocolError`; no se "repara" en silencio.
+Decisiones derivadas del contrato real:
+
+- **Los fragmentos no llevan `tenant_id`**: el motor filtra por tenant en la búsqueda y declara el tenant a nivel de respuesta.
+  El cliente exige ese `tenant_id` (si falta ⇒ `RagProtocolError`) y lo estampa en cada `Chunk`; el auditor lo compara con el
+  solicitado (`RESPONSE_TENANT_MISMATCH` / `CROSS_TENANT_LEAK` ⇒ veto). La garantía de aislamiento *dentro* del motor sigue
+  siendo suya (filtro + RLS); el comité verifica lo que es verificable desde fuera.
+- **`draft_answer: null`** (el motor no encontró respuesta) ⇒ se sustituye por un texto propio (`NO_ANSWER_TEXT`), que el comité
+  valida como abstención; nunca se inventa contenido del motor.
+- Las citas del borrador son `[n]` con `n = index` del fragmento: el crítico de alucinaciones las valida contra esos índices.
+- `top_k` máximo 20; el cliente no envía `filters`/`min_score` (el servicio los rechazaría con 422).
+- `draft_verified` es siempre `false`: precisamente por eso existe este comité.
 
 ## El comité
 
 | Agente | Qué verifica | Veto |
 |--------|--------------|------|
-| `HallucinationCritic` | Cada afirmación del borrador frente a los fragmentos (solapamiento léxico por frase y por fragmento), cifras inventadas, nombres propios ausentes, citas `[id]`/`[n]` inexistentes. Una abstención honesta puntúa 1.0 | Respuesta con contenido pero **sin evidencia** |
+| `HallucinationCritic` | Cada afirmación del borrador frente a los fragmentos (solapamiento léxico por frase y por fragmento), cifras inventadas, nombres propios ausentes, citas `[n]` inexistentes. Una abstención honesta puntúa 1.0 | Respuesta con contenido pero **sin evidencia** |
 | `TenantSecurityAuditor` | Todo fragmento pertenece al `tenant_id` pedido (también en `metadata`); la respuesta no declara otro tenant; el borrador no copia contenido ni menciona IDs de otro tenant; sin secretos/credenciales; PII (penaliza); **inyección de prompts** en el contexto (penaliza; veta si el borrador la repite) | Fuga entre tenants, fragmento sin `tenant_id` (no verificable), secretos, inyección reproducida |
-| `CoherenceValidator` | Relevancia frente a la consulta, contradicciones directas, repetición degenerada, truncamiento, baja relevancia de la recuperación | — (una contradicción por sí sola hace fallar el umbral) |
+| `CoherenceValidator` | Relevancia frente a la consulta, contradicciones directas, repetición degenerada, truncamiento y (opcional, `retrieval_score_floor`) baja relevancia de la recuperación; la escala de `score` depende del reranker del motor, por eso no se asume ninguna | — (una contradicción por sí sola hace fallar el umbral) |
 
 Los agentes son deterministas (sin LLM): reproducibles, auditables y sin coste. Se pueden sustituir o ampliar con cualquier
 objeto que cumpla `CommitteeAgent` (`name` + `async assess(ctx) -> Assessment`), p. ej. un juez basado en LLM.
@@ -81,6 +93,16 @@ Un agente no puede votar en nombre de otro (`InvalidAssessment`) y los agentes a
 
 ## Errores de red
 
+## Auditoría
+
+Cada decisión (aprobada, rechazada o por fallo del motor) genera un `AuditRecord` con `request_id`, **`tenant_id`**, veredicto,
+puntuación agregada, puntuación/veto/códigos de hallazgo de cada agente, motivos, `error_code` e ids de fragmentos. **Nunca** contiene
+la consulta, el borrador ni el texto de los fragmentos, y los mensajes de los hallazgos tampoco citan el borrador. El destino es un
+`AuditSink` (por defecto `LoggingAuditSink`: una línea JSON en el logger `rag_consensus.audit`). La auditoría es *fail-closed*: si
+`emit` lanza, la respuesta se retiene (`AUDIT_FAILED`).
+
+## Errores de red
+
 `RagClient.retrieve` sólo lanza subclases de `RagError`: `RagConnectionError`, `RagTimeoutError`, `RagHttpError(status)`,
 `RagProtocolError`. Reintenta con *backoff* exponencial ante errores de transporte y `429/502/503/504` (respeta
 `Retry-After`, acotado a 5 s); los demás `4xx/5xx` no se reintentan. **El orquestador nunca propaga esos errores**: devuelve
@@ -90,22 +112,33 @@ un `GuardedAnswer` `REJECTED` con `error_code`, de modo que nadie pueda entregar
 
 - HTTPS obligatorio salvo loopback (o `allow_insecure_http=True` explícito); verificación TLS no desactivable fuera de loopback.
 - Sin credenciales en la URL; `api_key` fuera de `repr`; **no se siguen redirecciones** (no se reenvía el bearer a otro host).
-- Los mensajes de error y los logs nunca contienen consultas, fragmentos ni cuerpos de respuesta; sólo códigos.
+- Los mensajes de error, los logs y los hallazgos nunca contienen consultas, fragmentos ni borradores; sólo códigos y recuentos.
 - `tenant_id` validado por expresión regular y longitud antes de cualquier llamada de red.
 - Un borrador rechazado no aparece en ningún campo de `GuardedAnswer` (`answer=None`).
 
-## Desarrollo
+## Desarrollo y verificación
 
 ```bash
 cd rag_consensus
 python -m pip install -e '.[dev]'
-python -m pytest -q          # 99 pruebas: cliente (httpx.MockTransport), agentes, consenso, orquestador y sockets reales en loopback
+python -m pytest -q                  # 104 pruebas rápidas: cliente (MockTransport), agentes, consenso, orquestador, sockets reales en loopback
 python -m mypy --strict src tests
+./scripts/run_e2e.sh                 # +8 E2E contra el servicio REAL ContextRAG_Engine y PostgreSQL real (clona y prepara todo)
 ```
+
+La suite E2E (`tests/e2e/`) levanta PostgreSQL 16 efímero (rol de aplicación sin `BYPASSRLS`), arranca el servicio real con tres
+documentos de dos tenants y claves de API ligadas a tenant, y comprueba: respuesta aprobada con cita y auditoría con `tenant_id`;
+aislamiento entre tenants; coherencia entre la auditoría del comité y la del motor (RLS incluida); suplantación de tenant (`403`);
+clave inválida (`401`); documento envenenado con *prompt injection*; y caída de la BD del motor (`503` ⇒ fail-closed).
+Sin `CONTEXTRAG_ENGINE_PATH`/`CONTEXTRAG_PYTHON`/PostgreSQL esas pruebas se **omiten** con el motivo.
+Probado contra `contextrag_engine@83869d8` (revisión del código) y `@479f81f` (HEAD en el momento de la verificación E2E).
 
 ## Límites conocidos
 
 - Los agentes usan heurísticas léxicas (solapamiento, cifras, entidades): detectan bien invenciones de datos y fugas
   estructurales, pero no razonamiento semántico fino; para eso conviene añadir un agente-juez LLM (la interfaz ya lo permite)
   **sin** quitar los deterministas, que actúan como suelo de seguridad.
-- El contrato con ContextRAG_Engine está supuesto (ver arriba) y no se ha probado contra el servicio real.
+- El motor se probó con su stack `offline` (embeddings *hashing*, reranker léxico, índices en memoria) y generador extractivo; con
+  embeddings/rerankers/LLM reales cambian las puntuaciones y los borradores, no el contrato.
+- Tenant: el comité sólo puede verificar el tenant *declarado* por el motor (los fragmentos no llevan el suyo); un motor que
+  etiquete mal contenido ajeno sólo se detecta por huellas (IDs/contenido ajenos, secretos), no por etiqueta.

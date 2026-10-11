@@ -54,3 +54,17 @@ jobs:
       - run: pip install -e '.[dev]'
       - run: python -m mypy --strict src tests
       - run: python -m pytest -q
+
+  rag-consensus-e2e:
+    # Contra el servicio REAL ContextRAG_Engine + PostgreSQL real (instalado en los runners de GitHub)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rag_consensus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e '.[dev]'
+      - run: ./scripts/run_e2e.sh

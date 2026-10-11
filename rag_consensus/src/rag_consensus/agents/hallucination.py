@@ -37,7 +37,7 @@ class HallucinationCritic:
         union_entities = frozenset(fold(w) for c in chunks for s in split_sentences(c.text) for w in entities(s)) | union
 
         scores: list[float] = []
-        for sentence in split_sentences(draft):
+        for n, sentence in enumerate(split_sentences(draft), start=1):
             toks = content_tokens(sentence)
             if len(toks) < _MIN_CLAIM_TOKENS:
                 continue  # frase conectora / sin contenido verificable
@@ -48,21 +48,21 @@ class HallucinationCritic:
             bad_numbers = numbers(sentence) - union_numbers
             if bad_numbers:
                 score *= 0.3
-                findings.append(Finding("UNSUPPORTED_NUMBER", f"Cifra(s) sin respaldo en las fuentes: {', '.join(sorted(bad_numbers))}.", Severity.CRITICAL))
+                findings.append(Finding("UNSUPPORTED_NUMBER", f"{len(bad_numbers)} cifra(s) de la frase {n} sin respaldo en las fuentes.", Severity.CRITICAL))
             bad_entities = entities(sentence) - union_entities
             if bad_entities:
                 score *= 0.8
-                findings.append(Finding("UNSUPPORTED_ENTITY", f"Nombre(s) ausentes de las fuentes: {', '.join(sorted(bad_entities))}.", Severity.WARNING))
+                findings.append(Finding("UNSUPPORTED_ENTITY", f"{len(bad_entities)} nombre(s) de la frase {n} ausentes de las fuentes.", Severity.WARNING))
             if score < CLAIM_SUPPORTED:
-                findings.append(Finding("UNSUPPORTED_CLAIM", f"Afirmación con respaldo insuficiente ({score:.2f}): «{sentence[:80]}».", Severity.WARNING))
+                findings.append(Finding("UNSUPPORTED_CLAIM", f"La frase {n} tiene respaldo insuficiente ({score:.2f}).", Severity.WARNING))
             scores.append(score)
 
-        known_refs = {c.id for c in chunks} | {str(i) for i in range(1, len(chunks) + 1)}
+        known_refs = {c.id for c in chunks} | {str(c.metadata["index"]) for c in chunks if "index" in c.metadata} | {str(i) for i in range(1, len(chunks) + 1)}
         bad_refs = {m for m in CITATION.findall(draft) if m not in known_refs}
         total = sum(scores) / len(scores) if scores else 0.0
         if not scores:
             findings.append(Finding("NO_VERIFIABLE_CLAIMS", "El borrador no contiene afirmaciones verificables.", Severity.WARNING))
         if bad_refs:
             total *= 0.5
-            findings.append(Finding("INVALID_CITATION", f"Citas a fuentes inexistentes: {', '.join(sorted(bad_refs))}.", Severity.CRITICAL))
+            findings.append(Finding("INVALID_CITATION", f"{len(bad_refs)} cita(s) a fuentes inexistentes.", Severity.CRITICAL))
         return Assessment(self.name, round(max(0.0, min(1.0, total)), 4), findings=tuple(findings))

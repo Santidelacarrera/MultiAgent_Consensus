@@ -33,18 +33,17 @@ def test_happy_path_delivers_answer_and_citations() -> None:
     out = run(orch.answer(REQUEST))
     assert out.approved and out.verdict is Verdict.APPROVED
     assert out.answer and "30 días" in out.answer
-    assert out.citations == ("c1",) and out.error_code is None and not out.decision.reasons
+    assert out.citations == ("politicas.md:1",) and out.error_code is None and not out.decision.reasons
     assert {a.agent for a in out.decision.assessments} == {"hallucination_critic", "tenant_security_auditor", "coherence_validator"}
 
 
-def test_cross_tenant_leak_blocks_delivery() -> None:
-    chunks = [
-        {"id": "c1", "text": POLICY_TEXT, "score": 0.9, "tenant_id": TENANT},
-        {"id": "c2", "text": "Documento interno de otro cliente.", "score": 0.8, "tenant_id": "globex"},
-    ]
-    out = run(orchestrator_for(lambda r: httpx.Response(200, json=rag_body(chunks=chunks))).answer(REQUEST))
+def test_response_for_another_tenant_blocks_delivery() -> None:
+    """El motor devuelve contenido de otro tenant: el tenant declarado en la respuesta no coincide con el solicitado."""
+    out = run(orchestrator_for(lambda r: httpx.Response(200, json=rag_body(tenant="globex"))).answer(REQUEST))
     assert out.verdict is Verdict.REJECTED and out.answer is None and not out.approved
     assert "VETO:tenant_security_auditor" in out.decision.reasons
+    codes = {f.code for a in out.decision.assessments for f in a.findings}
+    assert {"RESPONSE_TENANT_MISMATCH", "CROSS_TENANT_LEAK"} <= codes
 
 
 def test_hallucinated_figure_blocks_delivery() -> None:
@@ -55,9 +54,10 @@ def test_hallucinated_figure_blocks_delivery() -> None:
 
 
 def test_rejected_answer_never_exposes_the_draft_anywhere() -> None:
-    body = rag_body("DRAFT-SECRETO 365 días", chunks=[])
+    body = rag_body("DRAFT-SECRETO 365 días", fragments=[{"index": 1, "score": 0.1, "doc_id": "x.md", "source": "x.md", "section": "", "page": None, "start": 0, "end": 1, "text": "otra cosa"}])
     out = run(orchestrator_for(lambda r: httpx.Response(200, json=body)).answer(REQUEST))
-    assert out.answer is None and "DRAFT-SECRETO" not in repr(out)
+    blob = repr(out) + "".join(f.message for a in out.decision.assessments for f in a.findings)
+    assert out.answer is None and "DRAFT-SECRETO" not in blob and "365" not in blob
 
 
 def test_rag_network_failure_is_a_rejection_not_an_exception() -> None:

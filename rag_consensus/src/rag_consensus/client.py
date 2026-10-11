@@ -1,15 +1,19 @@
-"""Cliente HTTP asíncrono hacia el endpoint de recuperación de ContextRAG_Engine.
+"""Cliente HTTP asíncrono hacia `POST /api/v1/retrieve` de ContextRAG_Engine.
 
-Contrato asumido (configurable con `RagClientConfig.retrieve_path`):
+Contrato (verificado contra contextrag/api/retrieval.py del servicio):
 
-    POST {base_url}{retrieve_path}
-    → {"tenant_id": str, "query": str, "top_k": int, "filters"?: {...}, "min_score"?: float}
-    ← {"tenant_id"?: str,
-       "draft_answer": str            (alias admitido: "answer"),
-       "chunks": [{"id": str, "text": str, "score": number, "tenant_id"?: str,
-                   "source"?: str, "metadata"?: {...}}]}      (alias: "chunk_id", "content")
+    POST {base_url}{retrieve_path}                      (por defecto /api/v1/retrieve)
+    Cabeceras:  X-API-Key: <clave ligada a un tenant>,  X-Tenant: <tenant_id>
+    Cuerpo:     {"tenant_id": str, "query": str (1..4000), "top_k": int (1..20)}      (campos extra ⇒ 422)
+    200:        {"status": "ok" | "no_results", "tenant_id": str, "query": str,
+                 "fragments": [{"index": int (1-based), "score": float, "doc_id": str, "source": str,
+                                "section": str, "page": int | null, "start": int, "end": int, "text": str}],
+                 "draft_answer": str | null, "draft_verified": false, "latency_ms": float}
+    Errores:    401 clave inválida · 403 tenant no autorizado · 422 cuerpo inválido · 429 límite · 503 BD no disponible
 
-Cualquier desviación se rechaza con `RagProtocolError`; no se "arregla" la respuesta en silencio.
+Los fragmentos NO llevan `tenant_id` propio: el servicio filtra por tenant en la búsqueda y con RLS en la auditoría, y
+declara el tenant a nivel de respuesta. Este cliente estampa ese tenant en cada `Chunk` para que el comité pueda
+verificarlo contra el solicitado. Cualquier desviación del contrato se rechaza con `RagProtocolError`.
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ import httpx
 
 from .config import RagClientConfig
 from .errors import RagConnectionError, RagHttpError, RagProtocolError, RagTimeoutError
-from .models import Chunk, RetrievalRequest, RetrievalResponse
+from .models import NO_ANSWER_TEXT, Chunk, RetrievalRequest, RetrievalResponse
 
 log = logging.getLogger("rag_consensus.client")
 
@@ -51,7 +55,7 @@ class RagClient:
     ) -> None:
         headers = {"accept": "application/json", "user-agent": "multiagent-consensus/rag-client"}
         if config.api_key:
-            headers["authorization"] = f"Bearer {config.api_key}"
+            headers[config.api_key_header] = config.api_key
         self._config = config
         self._sleep = sleep
         self._http = httpx.AsyncClient(
@@ -85,7 +89,7 @@ class RagClient:
         for attempt in range(attempts):
             retry_after: float | None = None
             try:
-                resp = await self._http.post(cfg.url, json=request.to_payload())
+                resp = await self._http.post(cfg.url, json=request.to_payload(), headers={"X-Tenant": request.tenant_id})
             except httpx.TimeoutException:
                 last_timeout = True
                 log.warning("rag timeout (intento %d/%d)", attempt + 1, attempts)
@@ -123,42 +127,55 @@ class RagClient:
         if not isinstance(body, dict):
             raise RagProtocolError("la respuesta debe ser un objeto JSON")
 
-        draft = body.get("draft_answer", body.get("answer"))
-        if not isinstance(draft, str):
-            raise RagProtocolError("falta 'draft_answer' (string)")
-        raw_chunks = body.get("chunks")
-        if not isinstance(raw_chunks, list) or len(raw_chunks) > _MAX_CHUNKS:
-            raise RagProtocolError("'chunks' debe ser una lista (≤ 200)")
+        status = body.get("status")
+        if status not in ("ok", "no_results"):
+            raise RagProtocolError("'status' debe ser 'ok' o 'no_results'")
         tenant = body.get("tenant_id")
-        if tenant is not None and not isinstance(tenant, str):
-            raise RagProtocolError("'tenant_id' debe ser string")
+        if not isinstance(tenant, str) or not tenant:
+            raise RagProtocolError("falta 'tenant_id' en la respuesta")  # sin él no se puede verificar el aislamiento
+        raw_fragments = body.get("fragments")
+        if not isinstance(raw_fragments, list) or len(raw_fragments) > _MAX_CHUNKS:
+            raise RagProtocolError("'fragments' debe ser una lista (≤ 200)")
+        draft = body.get("draft_answer")
+        if draft is not None and not isinstance(draft, str):
+            raise RagProtocolError("'draft_answer' debe ser string o null")
 
-        chunks = tuple(_parse_chunk(c, i) for i, c in enumerate(raw_chunks))
-        return RetrievalResponse(draft_answer=draft, chunks=chunks, tenant_id=tenant)
+        chunks = tuple(_parse_fragment(f, i, tenant) for i, f in enumerate(raw_fragments))
+        synthesized = draft is None or not draft.strip()
+        return RetrievalResponse(
+            draft_answer=NO_ANSWER_TEXT if synthesized else str(draft),
+            chunks=chunks,
+            tenant_id=tenant,
+            status=str(status),
+            synthesized_abstention=synthesized,
+        )
 
 
-def _parse_chunk(raw: object, index: int) -> Chunk:
+def _parse_fragment(raw: object, position: int, tenant: str) -> Chunk:
     if not isinstance(raw, dict):
-        raise RagProtocolError(f"chunks[{index}] no es un objeto")
-    cid = raw.get("id", raw.get("chunk_id"))
-    text = raw.get("text", raw.get("content"))
-    score = raw.get("score")
-    if not isinstance(cid, str) or not cid:
-        raise RagProtocolError(f"chunks[{index}].id inválido")
+        raise RagProtocolError(f"fragments[{position}] no es un objeto")
+    index, doc_id, text, score = raw.get("index"), raw.get("doc_id"), raw.get("text"), raw.get("score")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 1:
+        raise RagProtocolError(f"fragments[{position}].index inválido")
+    if not isinstance(doc_id, str) or not doc_id:
+        raise RagProtocolError(f"fragments[{position}].doc_id inválido")
     if not isinstance(text, str):
-        raise RagProtocolError(f"chunks[{index}].text inválido")
+        raise RagProtocolError(f"fragments[{position}].text inválido")
     if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
-        raise RagProtocolError(f"chunks[{index}].score inválido")
-    tenant = raw.get("tenant_id")
-    source = raw.get("source")
-    meta = raw.get("metadata", {})
-    if tenant is not None and not isinstance(tenant, str):
-        raise RagProtocolError(f"chunks[{index}].tenant_id inválido")
+        raise RagProtocolError(f"fragments[{position}].score inválido")
+    source, section = raw.get("source"), raw.get("section")
     if source is not None and not isinstance(source, str):
-        raise RagProtocolError(f"chunks[{index}].source inválido")
-    if not isinstance(meta, dict):
-        raise RagProtocolError(f"chunks[{index}].metadata inválido")
-    return Chunk(id=cid, text=text, score=float(score), tenant_id=tenant, source=source, metadata=dict(meta))
+        raise RagProtocolError(f"fragments[{position}].source inválido")
+    if section is not None and not isinstance(section, str):
+        raise RagProtocolError(f"fragments[{position}].section inválido")
+    return Chunk(
+        id=f"{doc_id}:{index}",
+        text=text,
+        score=float(score),
+        tenant_id=tenant,  # tenant declarado por el servicio para toda la respuesta
+        source=source,
+        metadata={"index": index, "doc_id": doc_id, "section": section, "page": raw.get("page"), "start": raw.get("start"), "end": raw.get("end"), "tenant_source": "response"},
+    )
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:

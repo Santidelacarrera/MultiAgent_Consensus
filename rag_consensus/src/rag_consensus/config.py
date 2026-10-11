@@ -13,6 +13,9 @@ TENANT_SECURITY = "tenant_security_auditor"
 COHERENCE = "coherence_validator"
 AGENT_NAMES: tuple[str, ...] = (HALLUCINATION, TENANT_SECURITY, COHERENCE)
 
+#: Ruta expuesta por ContextRAG_Engine para la recuperación.
+DEFAULT_RETRIEVE_PATH = "/api/v1/retrieve"
+
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -21,8 +24,10 @@ class RagClientConfig:
     """Configuración del cliente HTTP. HTTPS es obligatorio salvo loopback o `allow_insecure_http=True`."""
 
     base_url: str
-    retrieve_path: str = "/v1/retrieve"
+    retrieve_path: str = DEFAULT_RETRIEVE_PATH
     api_key: str | None = field(default=None, repr=False)  # nunca aparece en repr/logs
+    #: Cabecera con la que ContextRAG_Engine autentica (la clave queda ligada a un tenant en el servidor).
+    api_key_header: str = "X-API-Key"
     timeout_s: float = 10.0
     max_retries: int = 2
     backoff_s: float = 0.2

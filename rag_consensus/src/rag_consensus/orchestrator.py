@@ -6,12 +6,13 @@ import logging
 import uuid
 from typing import Sequence
 
+from .audit import AuditSink, LoggingAuditSink, build_record
 from .agents import AssessmentContext, CoherenceValidator, CommitteeAgent, HallucinationCritic, TenantSecurityAuditor
 from .client import RetrievalPort
 from .config import ConsensusPolicy
 from .consensus import decide, rejected
 from .errors import RagError
-from .models import AgentFailure, Assessment, GuardedAnswer, RetrievalRequest, Verdict
+from .models import AgentFailure, Assessment, ConsensusDecision, GuardedAnswer, RetrievalRequest, Verdict
 
 log = logging.getLogger("rag_consensus.orchestrator")
 
@@ -27,8 +28,15 @@ class ConsensusOrchestrator:
     con `error_code`, de modo que ningún llamador pueda entregar por descuido una respuesta sin validar.
     """
 
-    def __init__(self, retriever: RetrievalPort, policy: ConsensusPolicy | None = None, agents: Sequence[CommitteeAgent] | None = None) -> None:
+    def __init__(
+        self,
+        retriever: RetrievalPort,
+        policy: ConsensusPolicy | None = None,
+        agents: Sequence[CommitteeAgent] | None = None,
+        audit: AuditSink | None = None,
+    ) -> None:
         self._retriever = retriever
+        self._audit: AuditSink = audit or LoggingAuditSink()
         self._policy = policy or ConsensusPolicy()
         self._agents: tuple[CommitteeAgent, ...] = tuple(agents) if agents is not None else default_committee(self._policy)
 
@@ -37,19 +45,39 @@ class ConsensusOrchestrator:
         try:
             response = await self._retriever.retrieve(request)
         except RagError as e:
-            log.warning("request=%s rag=%s → REJECTED", request_id, e.code)
-            return GuardedAnswer(request_id, Verdict.REJECTED, None, rejected(e.code), error_code=e.code)
+            log.warning("request=%s tenant=%s rag=%s → REJECTED", request_id, request.tenant_id, e.code)
+            decision = rejected(e.code)
+            return self._finalize(request, request_id, decision, None, (), e.code)
 
         ctx = AssessmentContext(request, response)
         results = await asyncio.gather(*(self._run(agent, ctx) for agent in self._agents))
         assessments = [r for r in results if isinstance(r, Assessment)]
         failures = [r for r in results if isinstance(r, AgentFailure)]
         decision = decide(assessments, failures, self._policy)
+        approved = response.draft_answer if decision.verdict is Verdict.APPROVED else None
+        return self._finalize(request, request_id, decision, approved, tuple(c.id for c in response.chunks), None)
 
-        log.info("request=%s verdict=%s score=%.2f reasons=%s", request_id, decision.verdict.value, decision.aggregate_score, ",".join(decision.reasons) or "-")
-        if decision.verdict is not Verdict.APPROVED:
-            return GuardedAnswer(request_id, Verdict.REJECTED, None, decision)
-        return GuardedAnswer(request_id, Verdict.APPROVED, response.draft_answer, decision, citations=tuple(c.id for c in response.chunks))
+    def _finalize(
+        self,
+        request: RetrievalRequest,
+        request_id: str,
+        decision: ConsensusDecision,
+        answer: str | None,
+        chunk_ids: tuple[str, ...],
+        error_code: str | None,
+    ) -> GuardedAnswer:
+        """Audita SIEMPRE antes de entregar: si no se puede dejar traza, no sale la respuesta (fail-closed)."""
+        record = build_record(request_id=request_id, tenant_id=request.tenant_id, decision=decision, error_code=error_code, chunk_ids=chunk_ids)
+        try:
+            self._audit.emit(record)
+        except Exception as e:  # noqa: BLE001 — el destino de auditoría es externo
+            log.error("request=%s tenant=%s audit sink falló (%s) → REJECTED", request_id, request.tenant_id, type(e).__name__)
+            failed = ConsensusDecision(Verdict.REJECTED, decision.aggregate_score, decision.assessments, decision.failures, (*decision.reasons, "AUDIT_FAILED"))
+            return GuardedAnswer(request_id, Verdict.REJECTED, None, failed, error_code="AUDIT_FAILED")
+        log.info("request=%s tenant=%s verdict=%s score=%.2f", request_id, request.tenant_id, decision.verdict.value, decision.aggregate_score)
+        if decision.verdict is not Verdict.APPROVED or answer is None:
+            return GuardedAnswer(request_id, Verdict.REJECTED, None, decision, error_code=error_code)
+        return GuardedAnswer(request_id, Verdict.APPROVED, answer, decision, citations=chunk_ids)
 
     async def _run(self, agent: CommitteeAgent, ctx: AssessmentContext) -> Assessment | AgentFailure:
         try:

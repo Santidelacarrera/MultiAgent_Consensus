@@ -24,3 +24,5 @@ strict = true
 python_version = "3.11"
 mypy_path = "src"
 packages = ["rag_consensus"]
+# engine_service.py corre con el intérprete del motor (otro entorno), no con el de este paquete
+exclude = ["tests/e2e/engine_service\\.py"]
