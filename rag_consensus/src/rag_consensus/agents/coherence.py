@@ -7,11 +7,15 @@ from ..text import content_tokens, fold, is_abstention, negation_signature, spli
 from .base import AssessmentContext
 
 _MAX_REPETITION = 0.30
-_LOW_RETRIEVAL = 0.30
 
 
 class CoherenceValidator:
     name = COHERENCE
+
+    def __init__(self, *, retrieval_score_floor: float | None = None) -> None:
+        # La escala de `score` depende del reranker del motor (léxico 0..1, cross-encoder en logits…): por defecto no se
+        # asume ninguna; si se conoce, se fija aquí el mínimo aceptable para el mejor fragmento.
+        self._floor = retrieval_score_floor
 
     async def assess(self, ctx: AssessmentContext) -> Assessment:
         draft = ctx.response.draft_answer.strip()
@@ -59,7 +63,7 @@ class CoherenceValidator:
 
         # Calidad de la recuperación (sólo si las puntuaciones están en [0, 1]).
         scores = [c.score for c in ctx.response.chunks]
-        if scores and all(0.0 <= s <= 1.0 for s in scores) and max(scores) < _LOW_RETRIEVAL and not abstains:
+        if self._floor is not None and scores and max(scores) < self._floor and not abstains:
             penalty += 0.2
             findings.append(Finding("LOW_RETRIEVAL_SCORE", "Los fragmentos recuperados tienen baja relevancia.", Severity.WARNING))
 

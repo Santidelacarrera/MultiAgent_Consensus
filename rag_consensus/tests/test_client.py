@@ -15,37 +15,59 @@ from rag_consensus import (
     RetrievalRequest,
 )
 
-from .helpers import REQUEST, make_client, rag_body, run
+from .helpers import REQUEST, fragment, make_client, rag_body, run
 
 
 def ok(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=rag_body())
 
 
-def test_sends_tenant_query_and_params_and_parses_response() -> None:
-    seen: dict[str, object] = {}
+def test_default_route_is_api_v1_retrieve_with_exact_contract() -> None:
+    seen: list[httpx.Request] = []
 
     def handler(req: httpx.Request) -> httpx.Response:
-        seen["url"] = str(req.url)
-        seen["body"] = json.loads(req.content)
-        seen["auth"] = req.headers.get("authorization")
+        seen.append(req)
+        if (req.method, req.url.path) != ("POST", "/api/v1/retrieve"):
+            return httpx.Response(404)  # cualquier otra ruta/método falla ruidosamente
         return httpx.Response(200, json=rag_body())
 
-    client, _ = make_client(handler, api_key="s3cret", retrieve_path="/api/retrieve")
-    req = RetrievalRequest("acme", "plazo de devolución", top_k=7, filters={"lang": "es", "year": 2026}, min_score=0.4)
-    resp = run(client.retrieve(req))
-    assert seen["url"] == "https://rag.internal/api/retrieve"
-    assert seen["body"] == {"tenant_id": "acme", "query": "plazo de devolución", "top_k": 7, "filters": {"lang": "es", "year": 2026}, "min_score": 0.4}
-    assert seen["auth"] == "Bearer s3cret"
-    assert resp.tenant_id == "acme" and resp.chunks[0].id == "c1" and resp.chunks[0].tenant_id == "acme"
-    assert "30 días" in resp.draft_answer
+    client, _ = make_client(handler, api_key="s3cret")
+    resp = run(client.retrieve(RetrievalRequest("acme", "plazo de devolución", top_k=7)))
+    req = seen[0]
+    assert str(req.url) == "https://rag.internal/api/v1/retrieve" and req.method == "POST"
+    # el servicio usa extra="forbid": el cuerpo contiene EXACTAMENTE estos tres campos
+    assert json.loads(req.content) == {"tenant_id": "acme", "query": "plazo de devolución", "top_k": 7}
+    # autenticación y tenant por cabecera, como exige ContextRAG_Engine
+    assert req.headers["x-api-key"] == "s3cret" and req.headers["x-tenant"] == "acme"
+    assert "authorization" not in req.headers
+    assert resp.tenant_id == "acme" and resp.status == "ok" and not resp.synthesized_abstention
 
 
-def test_accepts_documented_aliases() -> None:
-    body = {"answer": "x", "chunks": [{"chunk_id": "k", "content": "t", "score": 1}]}
-    client, _ = make_client(lambda r: httpx.Response(200, json=body))
+def test_fragments_are_mapped_to_chunks_stamped_with_the_response_tenant() -> None:
+    frs = [fragment(1, "Texto uno.", "a.md", 0.9), fragment(2, "Texto dos.", "b.md", 0.5)]
+    client, _ = make_client(lambda r: httpx.Response(200, json=rag_body(fragments=frs)))
     resp = run(client.retrieve(REQUEST))
-    assert resp.draft_answer == "x" and resp.chunks[0].id == "k" and resp.chunks[0].tenant_id is None
+    assert [c.id for c in resp.chunks] == ["a.md:1", "b.md:2"]
+    assert all(c.tenant_id == "acme" and c.metadata["tenant_source"] == "response" for c in resp.chunks)
+    assert resp.chunks[1].metadata["index"] == 2 and resp.chunks[1].score == 0.5 and resp.chunks[0].source == "a.md"
+
+
+def test_null_draft_becomes_an_explicit_abstention() -> None:
+    client, _ = make_client(lambda r: httpx.Response(200, json=rag_body(draft=None, fragments=[])))
+    resp = run(client.retrieve(REQUEST))
+    assert resp.status == "no_results" and resp.synthesized_abstention and resp.draft_answer.startswith("No se encontró")
+
+
+def test_custom_api_key_header_is_supported() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        return httpx.Response(200, json=rag_body())
+
+    client, _ = make_client(handler, api_key="k", api_key_header="X-Custom-Key")
+    run(client.retrieve(REQUEST))
+    assert seen[0].headers["x-custom-key"] == "k" and "x-api-key" not in seen[0].headers
 
 
 def test_retries_transient_http_then_succeeds_with_exponential_backoff() -> None:
@@ -129,16 +151,21 @@ def test_transient_failure_then_recovery() -> None:
     [
         httpx.Response(200, text="<html>no es json</html>"),
         httpx.Response(200, json=["lista"]),
-        httpx.Response(200, json={"chunks": []}),
-        httpx.Response(200, json={"draft_answer": 5, "chunks": []}),
-        httpx.Response(200, json={"draft_answer": "x"}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [{"id": "a", "text": "t", "score": "alto"}]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [{"id": "a", "text": "t", "score": True}]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [{"id": "", "text": "t", "score": 1}]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [{"id": "a", "text": "t", "score": 1, "tenant_id": 7}]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [{"id": "a", "text": "t", "score": 1, "metadata": []}]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": ["no-objeto"]}),
-        httpx.Response(200, json={"draft_answer": "x", "chunks": [], "tenant_id": 3}),
+        httpx.Response(200, json={"fragments": []}),  # sin status/tenant
+        httpx.Response(200, json={**rag_body(), "status": "raro"}),
+        httpx.Response(200, json={k: v for k, v in rag_body().items() if k != "tenant_id"}),  # sin tenant: no verificable
+        httpx.Response(200, json={**rag_body(), "tenant_id": ""}),
+        httpx.Response(200, json={**rag_body(), "draft_answer": 5}),
+        httpx.Response(200, json={**rag_body(), "fragments": "x"}),
+        httpx.Response(200, json={**rag_body(), "fragments": ["no-objeto"]}),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "score": "alto"}])),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "score": True}])),
+        httpx.Response(200, content=json.dumps(rag_body(fragments=[{**fragment(), "score": float("nan")}]), allow_nan=True).encode()),  # NaN literal
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "index": 0}])),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "index": "1"}])),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "doc_id": ""}])),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "text": None}])),
+        httpx.Response(200, json=rag_body(fragments=[{**fragment(), "source": 3}])),
     ],
 )
 def test_protocol_violations_are_rejected(response: httpx.Response) -> None:
@@ -171,7 +198,7 @@ def test_api_key_never_appears_in_repr() -> None:
         {"base_url": "http://rag.internal"},  # HTTP en red
         {"base_url": "ftp://rag"},
         {"base_url": "https://user:pw@rag.internal"},
-        {"base_url": "https://rag.internal", "retrieve_path": "v1/retrieve"},
+        {"base_url": "https://rag.internal", "retrieve_path": "api/v1/retrieve"},
         {"base_url": "https://rag.internal", "timeout_s": 0},
         {"base_url": "https://rag.internal", "max_retries": 9},
         {"base_url": "https://rag.internal", "verify_tls": False},
@@ -198,9 +225,7 @@ def test_http_is_allowed_on_loopback_and_when_explicit() -> None:
         {"tenant_id": "acme", "query": "   "},
         {"tenant_id": "acme", "query": "x" * 5000},
         {"tenant_id": "acme", "query": "x", "top_k": 0},
-        {"tenant_id": "acme", "query": "x", "top_k": 51},
-        {"tenant_id": "acme", "query": "x", "min_score": 1.5},
-        {"tenant_id": "acme", "query": "x", "min_score": float("nan")},
+        {"tenant_id": "acme", "query": "x", "top_k": 21},  # el servicio admite como máximo 20
     ],
 )
 def test_request_validation(kwargs: dict[str, object]) -> None:

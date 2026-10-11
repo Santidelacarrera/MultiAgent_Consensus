@@ -20,11 +20,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers.get("content-length", "0"))
         body = json.loads(self.rfile.read(length))
-        received.append({"path": self.path, "auth": self.headers.get("authorization"), "body": body})
-        if mode["value"] == "leak":
-            payload = rag_body(chunks=[{"id": "c1", "text": POLICY_TEXT, "score": 0.9, "tenant_id": "globex"}])
-        else:
-            payload = rag_body()
+        received.append({"path": self.path, "auth": self.headers.get("x-api-key"), "tenant": self.headers.get("x-tenant"), "body": body})
+        payload = rag_body(tenant="globex") if mode["value"] == "leak" else rag_body()
         data = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -55,7 +52,8 @@ def test_real_socket_roundtrip_approved(server: str) -> None:
         assert out.approved and out.verdict is Verdict.APPROVED
 
     run(go())
-    assert received[0]["path"] == "/v1/retrieve" and received[0]["auth"] == "Bearer k"
+    assert received[0]["path"] == "/api/v1/retrieve" and received[0]["auth"] == "k"
+    assert received[0]["tenant"] == "acme"
     assert received[0]["body"] == {"tenant_id": "acme", "query": REQUEST.query, "top_k": 3}
 
 

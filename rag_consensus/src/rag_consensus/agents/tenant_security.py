@@ -51,14 +51,14 @@ class TenantSecurityAuditor:
             if not declared:
                 if not self._allow_untagged:
                     veto = True
-                    findings.append(Finding("CHUNK_UNTAGGED", f"El fragmento '{chunk.id}' no declara tenant: no se puede verificar el aislamiento.", Severity.CRITICAL))
+                    findings.append(Finding("CHUNK_UNTAGGED", "Un fragmento no declara tenant: no se puede verificar el aislamiento.", Severity.CRITICAL))
                 continue
             foreign = declared - {tenant}
             if foreign:
                 veto = True
                 foreign_ids |= foreign
                 foreign_texts.append(chunk.text)
-                findings.append(Finding("CROSS_TENANT_LEAK", f"El fragmento '{chunk.id}' pertenece a otro tenant.", Severity.CRITICAL))
+                findings.append(Finding("CROSS_TENANT_LEAK", "Un fragmento pertenece a otro tenant.", Severity.CRITICAL))
 
         draft = resp.draft_answer
         folded_draft = fold(draft)
@@ -84,7 +84,7 @@ class TenantSecurityAuditor:
         injected = [c.id for c in resp.chunks if _INJECTION.search(c.text)]
         if injected:
             penalty += 0.25
-            findings.append(Finding("PROMPT_INJECTION_IN_CONTEXT", f"Instrucciones incrustadas en el contexto recuperado: {', '.join(sorted(injected)[:5])}.", Severity.WARNING))
+            findings.append(Finding("PROMPT_INJECTION_IN_CONTEXT", f"Instrucciones incrustadas en {len(injected)} fragmento(s) del contexto recuperado.", Severity.WARNING))
             if _INJECTION.search(draft):
                 veto = True
                 findings.append(Finding("PROMPT_INJECTION_ECHOED", "El borrador reproduce instrucciones inyectadas.", Severity.CRITICAL))

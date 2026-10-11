@@ -156,9 +156,10 @@ def test_abstention_is_coherent_and_empty_is_not() -> None:
     assert assess(CoherenceValidator(), response("")).score == 0.0
 
 
-def test_low_retrieval_scores_are_flagged() -> None:
-    a = assess(CoherenceValidator(), response(chunks=(chunk(score=0.1),)))
-    assert "LOW_RETRIEVAL_SCORE" in codes(a)
+def test_low_retrieval_scores_are_flagged_only_when_a_floor_is_configured() -> None:
+    low = response(chunks=(chunk(score=0.1),))
+    assert "LOW_RETRIEVAL_SCORE" not in codes(assess(CoherenceValidator(), low))  # escala dependiente del reranker: sin suposición
+    assert "LOW_RETRIEVAL_SCORE" in codes(assess(CoherenceValidator(retrieval_score_floor=0.3), low))
 
 
 def test_tenant_constant_matches_fixture() -> None:

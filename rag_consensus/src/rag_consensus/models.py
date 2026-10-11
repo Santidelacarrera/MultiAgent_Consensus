@@ -1,17 +1,18 @@
 """Modelos inmutables del dominio. Toda validación ocurre al construir (fail-fast)."""
 from __future__ import annotations
 
-import math
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from types import MappingProxyType
 from typing import Mapping
 
 TENANT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:\-]{0,127}$")
 MAX_QUERY_CHARS = 4_000
 
-FilterValue = str | int | float | bool
+MAX_TOP_K = 20  # límite del servicio (ContextRAG_Engine: 1 ≤ top_k ≤ 20)
+
+#: Texto propio (no del motor) que se entrega cuando el motor no encontró respuesta; el comité lo valida como abstención.
+NO_ANSWER_TEXT = "No se encontró información suficiente en las fuentes para responder a esta consulta."
 
 
 class Verdict(str, Enum):
@@ -27,13 +28,11 @@ class Severity(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class RetrievalRequest:
-    """Petición al motor de recuperación."""
+    """Petición al motor de recuperación (el servicio rechaza campos desconocidos: sólo se envían estos tres)."""
 
     tenant_id: str
     query: str
     top_k: int = 5
-    filters: Mapping[str, FilterValue] = field(default_factory=dict)
-    min_score: float | None = None
 
     def __post_init__(self) -> None:
         if not TENANT_RE.fullmatch(self.tenant_id):
@@ -42,19 +41,11 @@ class RetrievalRequest:
             raise ValueError("query vacía")
         if len(self.query) > MAX_QUERY_CHARS:
             raise ValueError(f"query demasiado larga (máx. {MAX_QUERY_CHARS})")
-        if not 1 <= self.top_k <= 50:
-            raise ValueError("top_k debe estar entre 1 y 50")
-        if self.min_score is not None and not (math.isfinite(self.min_score) and 0.0 <= self.min_score <= 1.0):
-            raise ValueError("min_score debe estar entre 0 y 1")
-        object.__setattr__(self, "filters", MappingProxyType(dict(self.filters)))
+        if not 1 <= self.top_k <= MAX_TOP_K:
+            raise ValueError(f"top_k debe estar entre 1 y {MAX_TOP_K}")
 
     def to_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {"tenant_id": self.tenant_id, "query": self.query, "top_k": self.top_k}
-        if self.filters:
-            payload["filters"] = dict(self.filters)
-        if self.min_score is not None:
-            payload["min_score"] = self.min_score
-        return payload
+        return {"tenant_id": self.tenant_id, "query": self.query, "top_k": self.top_k}
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +67,10 @@ class RetrievalResponse:
     draft_answer: str
     chunks: tuple[Chunk, ...]
     tenant_id: str | None = None
+    #: 'ok' | 'no_results' (según el servicio)
+    status: str = "ok"
+    #: True si el motor no aportó borrador (`draft_answer: null`) y se sustituyó por NO_ANSWER_TEXT.
+    synthesized_abstention: bool = False
 
 
 @dataclass(frozen=True, slots=True)
