@@ -6,7 +6,7 @@ import { EVENT_BUS, EventBus, streams } from '../bus/event_bus';
 import { DebateStore, STORE } from '../store/store';
 import { DebateRecord, DebateResult, DebateStatus, HumanResolution, StoredEvent } from '../types';
 import { CONFIG } from '../tokens';
-import { DebateEngine } from './debate_engine';
+import { DebateAborted, DebateEngine } from './debate_engine';
 import { filterDiff } from './diff_filter';
 import { RepoSettings } from './pr_input';
 import { Metrics } from './metrics';
@@ -27,6 +27,8 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
     private readonly counters: Metrics,
   ) {}
 
+  /** Debate en curso por PR: un push nuevo cancela el anterior (su resultado ya no aplica al commit vigente). */
+  private readonly activeByPr = new Map<string, { id: string; sha: string; ctrl: AbortController }>();
   private slots = 0;
   private readonly waiters: (() => void)[] = [];
 
@@ -64,7 +66,7 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
   async submit(pr: PullRequestContext, opts: { force?: boolean; settings?: RepoSettings } = {}): Promise<DebateRecord> {
     if (!opts.force) {
       const existing = await this.store.findByPrAndSha(pr.id, pr.headSha);
-      if (existing && existing.status !== 'error') return existing;
+      if (existing && existing.status !== 'error' && existing.status !== 'superseded') return existing;
     }
     const id = randomUUID();
     const rec: DebateRecord = {
@@ -86,24 +88,31 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
       finishedAt: null,
     };
     await this.store.saveDebate(rec);
-    const p = this.execute(rec, pr, opts.settings ?? {}).finally(() => this.running.delete(id));
+    const prev = this.activeByPr.get(pr.id);
+    if (prev && prev.sha !== pr.headSha) prev.ctrl.abort();
+    const ctrl = new AbortController();
+    this.activeByPr.set(pr.id, { id, sha: pr.headSha, ctrl });
+    const p = this.execute(rec, pr, opts.settings ?? {}, ctrl.signal).finally(() => {
+      this.running.delete(id);
+      if (this.activeByPr.get(pr.id)?.id === id) this.activeByPr.delete(pr.id);
+    });
     this.running.set(id, p);
     p.catch(() => undefined);
     return rec;
   }
 
-  private async execute(rec: DebateRecord, pr: PullRequestContext, settings: RepoSettings): Promise<DebateRecord> {
+  private async execute(rec: DebateRecord, pr: PullRequestContext, settings: RepoSettings, signal: AbortSignal): Promise<DebateRecord> {
     await this.acquire();
     this.counters.debateRunning(1);
     try {
-      return await this.executeNow(rec, pr, settings);
+      return await this.executeNow(rec, pr, settings, signal);
     } finally {
       this.counters.debateRunning(-1);
       this.release();
     }
   }
 
-  private async executeNow(rec: DebateRecord, basePr: PullRequestContext, settings: RepoSettings): Promise<DebateRecord> {
+  private async executeNow(rec: DebateRecord, basePr: PullRequestContext, settings: RepoSettings, signal: AbortSignal): Promise<DebateRecord> {
     const emit = async (type: string, payload: Record<string, unknown>) => {
       const at = new Date().toISOString();
       if (type === 'agent.fault') this.counters.fault(String(payload.kind));
@@ -131,7 +140,7 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
         policy: { ...this.config.policy, maxRounds: settings.maxRounds ?? this.config.policy.maxRounds },
         agentTimeoutMs: this.config.agentTimeoutMs,
       });
-      const result = await engine.run(rec.id, pr, emit);
+      const result = await engine.run(rec.id, pr, emit, signal);
       await this.expireStreams(rec.id);
       const done: DebateRecord = {
         ...rec,
@@ -149,6 +158,13 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
       return done;
     } catch (e) {
       await this.expireStreams(rec.id);
+      if (e instanceof DebateAborted) {
+        const sup: DebateRecord = { ...rec, status: 'superseded', reason: 'Reemplazado por un commit más reciente del mismo PR.', finishedAt: new Date().toISOString() };
+        await this.store.saveDebate(sup);
+        await this.store.appendEvent(rec.id, 'debate.superseded', {}, sup.finishedAt!);
+        this.counters.debateFinished('SUPERSEDED', 0, 0);
+        return sup;
+      }
       const failed: DebateRecord = { ...rec, status: 'error', reason: `Error del orquestador: ${(e as Error).message}`, finishedAt: new Date().toISOString() };
       await this.store.saveDebate(failed);
       this.counters.debateFinished('ERROR', 0, 0);
@@ -190,6 +206,10 @@ export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
   async metrics(id: string) {
     await this.get(id);
     return this.store.listMetrics(id);
+  }
+
+  recent(limit: number) {
+    return this.store.listRecent(limit);
   }
 
   history(prId: string) {

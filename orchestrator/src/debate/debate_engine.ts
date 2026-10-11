@@ -26,6 +26,9 @@ import {
 } from '../types';
 import { AgentFault, ResponseHub } from './response_hub';
 
+/** El debate se canceló porque llegó un commit más reciente del mismo PR. */
+export class DebateAborted extends Error {}
+
 export type DebateEventSink = (type: string, payload: Record<string, unknown>) => Promise<void> | void;
 
 export interface EngineOptions {
@@ -59,7 +62,7 @@ export class DebateEngine {
     this.profiles = opts.profiles ?? DEFAULT_PROFILES;
   }
 
-  async run(debateId: string, pr: PullRequestContext, emit: DebateEventSink = () => undefined): Promise<DebateResult> {
+  async run(debateId: string, pr: PullRequestContext, emit: DebateEventSink = () => undefined, signal?: AbortSignal): Promise<DebateResult> {
     const { policy, agents } = this.opts;
     const startedAt = this.now().toISOString();
     const files = parseDiff(pr.diff);
@@ -75,6 +78,7 @@ export class DebateEngine {
     let final: RoundEvaluation | undefined;
     try {
       for (let roundNo = 1; roundNo <= policy.maxRounds; roundNo++) {
+        if (signal?.aborted) throw new DebateAborted('reemplazado por un commit más reciente');
         await emit('round.started', { round: roundNo });
         const record = await this.playRound(roundNo, debateId, pr, files, hub, rounds, ejected, emit);
         rounds.push(record);

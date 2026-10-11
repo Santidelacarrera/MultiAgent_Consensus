@@ -266,3 +266,12 @@ def test_gitlab_ignores_other_events(make_client, world):
     c = make_client()
     assert gl_post(c, "Push Hook", {}).json()["status"] == "ignored"
     assert gl_post(c, "Note Hook", {"object_attributes": {"noteable_type": "Issue", "note": "/consensus approve x"}}).json()["status"] == "ignored"
+
+
+def test_superseded_debate_only_updates_status_without_touching_minutes_or_merging(make_client, world):
+    world.orch_view = approved_view(status="superseded", decision=None, verdict="SUPERSEDED", summary=None)
+    world.orch_submit_status = "superseded"
+    gh_post(make_client(auto_merge=True), "pull_request", pr_payload())
+    assert statuses(world)[-1]["state"] == "failure" and "más reciente" in statuses(world)[-1]["description"]
+    assert world.comments == []
+    assert world.of("PUT", "/repos/acme/shop/pulls/7/merge") == []

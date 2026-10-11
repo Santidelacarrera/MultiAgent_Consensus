@@ -357,6 +357,7 @@ Comportamiento común:
 
 - Acciones procesadas: PR abierto / reabierto / nuevos commits / listo para revisión (los *drafts* se ignoran).
 - Idempotencia por `(PR, commit)`: reenvíos de webhook no duplican debates.
+- **Debates obsoletos**: un push nuevo al mismo PR cancela el debate en curso del commit anterior (estado `superseded`, se comprueba al inicio de cada ronda); el gatekeeper sólo actualiza el estado de ese commit viejo, sin tocar la minuta ni fusionar.
 - `GATEKEEPER_AUTO_MERGE=true`: fusiona sólo con veredicto `APPROVED` (o aprobación humana) y **fija el SHA**, de modo que
   un push posterior invalida el merge.
 - `GATEKEEPER_REQUEST_CHANGES=true` (GitHub): además publica una revisión *request changes* en los rechazos.
@@ -393,6 +394,8 @@ Autenticación: cabecera `x-api-key: $ORCHESTRATOR_API_KEY` (o `Authorization: B
 | GET    | `/v1/debates/:id/events`          | Log ordenado del debate (persistido).                                           |
 | GET    | `/v1/debates/:id/metrics`         | Convergencia por ronda.                                                         |
 | GET    | `/v1/debates?prId=github:o/r#7`   | Histórico de debates de un PR.                                                  |
+| GET    | `/dashboard`                      | Dashboard de sólo lectura (HTML estático; pide la API key en el navegador y consulta `/v1/debates/recent`). |
+| GET    | `/v1/debates/recent?limit=`       | Últimos debates (para el dashboard).                                            |
 | GET    | `/metrics`                        | Métricas Prometheus (debates por decisión, expulsiones por tipo, rondas, convergencia media, activos/en cola). |
 | POST   | `/v1/debates/:id/resolution`      | Resolución humana `{reviewer, decision: approve\|reject, rationale}` (sólo si `escalated`). |
 

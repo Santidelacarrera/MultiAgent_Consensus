@@ -132,3 +132,20 @@ describe('API HTTP del orquestador', () => {
     expect((await store.getDebate('orphan'))!.status).toBe('error');
   });
 });
+
+describe('dashboard', () => {
+  it('sirve HTML estático sin datos ni innerHTML, y /v1/debates/recent lista con API key', async () => {
+    const { app } = await boot({ apiKey: 'k' });
+    const http = request(app.getHttpServer());
+    const page = await http.get('/dashboard').expect(200);
+    expect(page.headers['content-type']).toMatch(/text\/html/);
+    expect(page.headers['content-security-policy']).toContain("frame-ancestors 'none'");
+    expect(page.text).not.toContain('innerHTML');
+    await http.get('/v1/debates/recent').expect(401);
+    const c = await http.post('/v1/debates').set('x-api-key', 'k').send(body(CLEAN_PR())).expect(202);
+    await http.get(`/v1/debates/${c.body.id}?waitMs=5000`).set('x-api-key', 'k').expect(200);
+    const recent = await http.get('/v1/debates/recent?limit=5').set('x-api-key', 'k').expect(200);
+    expect(recent.body[0]).toMatchObject({ id: c.body.id, status: 'approved', repo: 'acme/shop' });
+    await app.close();
+  });
+});
