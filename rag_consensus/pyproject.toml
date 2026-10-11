@@ -1,0 +1,26 @@
+[project]
+name = "rag-consensus"
+version = "1.0.0"
+description = "Conector HTTP hacia ContextRAG_Engine y comité de consenso fail-closed para MultiAgent_Consensus"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy>=1.10"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+mypy_path = "src"
+packages = ["rag_consensus"]

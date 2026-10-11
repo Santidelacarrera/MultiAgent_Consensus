@@ -124,6 +124,7 @@ gatekeeper/               Gatekeeper (FastAPI)
   app/service.py          PR → debate → veredicto → estado/comentario/merge
   app/policy.py           Revalidación del resultado y mapeo a veredicto
   app/vcs/                Clientes GitHub y GitLab
+rag_consensus/            Conector HTTP a ContextRAG_Engine + comité de consenso fail-closed para RAG (Python, mypy --strict)
 db/init.sql               Esquema de PostgreSQL
 examples/                 Diffs de demostración
 docker-compose.yml        Redis + PostgreSQL + orquestador + gatekeeper (+ Ollama)
@@ -481,6 +482,9 @@ npm test                     # Jest: agentes, consenso, motor de debate, API HTT
 cd gatekeeper
 python3 -m pip install -r requirements-dev.txt
 python3 -m pytest -q         # webhooks, firmas, política, comandos humanos, GitHub/GitLab simulados
+
+cd ../rag_consensus          # conector RAG + comité (ver rag_consensus/README.md)
+python3 -m pip install -e '.[dev]' && python3 -m pytest -q && python3 -m mypy --strict src tests
 ```
 
 - Los tests de Redis y de PostgreSQL arrancan un `redis-server` y un PostgreSQL efímeros (si los binarios no están instalados, se omiten con un aviso; PostgreSQL además se prueba con `pg-mem`).
