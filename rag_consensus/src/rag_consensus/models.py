@@ -71,6 +71,8 @@ class RetrievalResponse:
     status: str = "ok"
     #: True si el motor no aportó borrador (`draft_answer: null`) y se sustituyó por NO_ANSWER_TEXT.
     synthesized_abstention: bool = False
+    #: `X-Request-Id` de la respuesta del motor (correlación con sus logs).
+    engine_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from dataclasses import dataclass
 from typing import Sequence
 
 from .audit import AuditSink, LoggingAuditSink, build_record
@@ -11,10 +12,19 @@ from .agents import AssessmentContext, CoherenceValidator, CommitteeAgent, Hallu
 from .client import RetrievalPort
 from .config import ConsensusPolicy
 from .consensus import decide, rejected
-from .errors import RagError
+from .errors import RagError, RagHttpError
 from .models import AgentFailure, Assessment, ConsensusDecision, GuardedAnswer, RetrievalRequest, Verdict
 
 log = logging.getLogger("rag_consensus.orchestrator")
+
+
+@dataclass(frozen=True, slots=True)
+class _Engine:
+    """Datos de correlación con ContextRAG_Engine para la auditoría."""
+
+    request_id: str | None = None
+    error: str | None = None
+    http_status: int | None = None
 
 
 def default_committee(policy: ConsensusPolicy) -> tuple[CommitteeAgent, ...]:
@@ -47,7 +57,9 @@ class ConsensusOrchestrator:
         except RagError as e:
             log.warning("request=%s tenant=%s rag=%s → REJECTED", request_id, request.tenant_id, e.code)
             decision = rejected(e.code)
-            return self._finalize(request, request_id, decision, None, (), e.code)
+            http = e if isinstance(e, RagHttpError) else None
+            engine = _Engine(e.engine_request_id, http.engine_error if http else None, http.status_code if http else None)
+            return self._finalize(request, request_id, decision, None, (), e.code, engine)
 
         ctx = AssessmentContext(request, response)
         results = await asyncio.gather(*(self._run(agent, ctx) for agent in self._agents))
@@ -55,7 +67,7 @@ class ConsensusOrchestrator:
         failures = [r for r in results if isinstance(r, AgentFailure)]
         decision = decide(assessments, failures, self._policy)
         approved = response.draft_answer if decision.verdict is Verdict.APPROVED else None
-        return self._finalize(request, request_id, decision, approved, tuple(c.id for c in response.chunks), None)
+        return self._finalize(request, request_id, decision, approved, tuple(c.id for c in response.chunks), None, _Engine(response.engine_request_id))
 
     def _finalize(
         self,
@@ -65,9 +77,12 @@ class ConsensusOrchestrator:
         answer: str | None,
         chunk_ids: tuple[str, ...],
         error_code: str | None,
+        engine: "_Engine",
     ) -> GuardedAnswer:
         """Audita SIEMPRE antes de entregar: si no se puede dejar traza, no sale la respuesta (fail-closed)."""
-        record = build_record(request_id=request_id, tenant_id=request.tenant_id, decision=decision, error_code=error_code, chunk_ids=chunk_ids)
+        record = build_record(request_id=request_id, tenant_id=request.tenant_id, decision=decision, error_code=error_code, chunk_ids=chunk_ids,
+            engine_request_id=engine.request_id, engine_error=engine.error, engine_http_status=engine.http_status,
+        )
         try:
             self._audit.emit(record)
         except Exception as e:  # noqa: BLE001 — el destino de auditoría es externo

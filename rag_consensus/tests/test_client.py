@@ -231,3 +231,25 @@ def test_http_is_allowed_on_loopback_and_when_explicit() -> None:
 def test_request_validation(kwargs: dict[str, object]) -> None:
     with pytest.raises(ValueError):
         RetrievalRequest(**kwargs)  # type: ignore[arg-type]
+
+
+def test_engine_request_id_is_captured_and_sanitized() -> None:
+    good, _ = make_client(lambda r: httpx.Response(200, json=rag_body(), headers={"X-Request-Id": "7f9c2c8e-1b1e-4c52-9a53-0f6f3f1d2a11"}))
+    assert run(good.retrieve(REQUEST)).engine_request_id == "7f9c2c8e-1b1e-4c52-9a53-0f6f3f1d2a11"
+    hostile, _ = make_client(lambda r: httpx.Response(200, json=rag_body(), headers={"X-Request-Id": "x" * 200}))
+    assert run(hostile.retrieve(REQUEST)).engine_request_id is None  # demasiado largo ⇒ se ignora
+    none, _ = make_client(lambda r: httpx.Response(200, json=rag_body()))
+    assert run(none.retrieve(REQUEST)).engine_request_id is None
+
+
+def test_http_errors_carry_engine_request_id_and_safe_error_code_only() -> None:
+    body = {"error": "database_unavailable", "request_id": "r-1", "detail": "stack trace con datos sensibles"}
+    client, _ = make_client(lambda r: httpx.Response(503, json=body, headers={"X-Request-Id": "r-1"}), max_retries=0)
+    with pytest.raises(RagHttpError) as ei:
+        run(client.retrieve(REQUEST))
+    assert (ei.value.status_code, ei.value.engine_request_id, ei.value.engine_error) == (503, "r-1", "database_unavailable")
+    assert "sensibles" not in str(ei.value)
+    odd, _ = make_client(lambda r: httpx.Response(403, json={"error": "<script>alert(1)</script>"}), max_retries=0)
+    with pytest.raises(RagHttpError) as e2:
+        run(odd.retrieve(REQUEST))
+    assert e2.value.engine_error is None  # un "código" que no es un identificador seguro se descarta

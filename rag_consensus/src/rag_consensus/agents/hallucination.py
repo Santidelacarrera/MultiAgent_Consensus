@@ -9,6 +9,9 @@ from .base import AssessmentContext
 #: Una frase se considera respaldada si su puntuación de soporte alcanza este valor.
 CLAIM_SUPPORTED = 0.60
 _MIN_CLAIM_TOKENS = 3
+#: Una cifra de la afirmación debe aparecer en una frase fuente que además comparta al menos esta fracción del resto de
+#: términos de la afirmación. Evita aprobar «el plazo es de 90 días» porque «90» figure en otra frase del mismo fragmento.
+NUMBER_CONTEXT_MIN = 0.50
 
 
 class HallucinationCritic:
@@ -33,7 +36,7 @@ class HallucinationCritic:
 
         union = frozenset().union(*(content_tokens(c.text) for c in chunks))
         per_chunk = [content_tokens(c.text) for c in chunks]
-        union_numbers = frozenset().union(*(numbers(c.text) for c in chunks))
+        source_sentences = [(content_tokens(s), numbers(s)) for c in chunks for s in split_sentences(c.text)]
         union_entities = frozenset(fold(w) for c in chunks for s in split_sentences(c.text) for w in entities(s)) | union
 
         scores: list[float] = []
@@ -45,10 +48,21 @@ class HallucinationCritic:
             best = max(len(toks & ct) / len(toks) for ct in per_chunk)
             score = 0.4 * overall + 0.6 * best
 
-            bad_numbers = numbers(sentence) - union_numbers
-            if bad_numbers:
+            words = frozenset(t for t in toks if not t.isdigit())
+            unsupported: set[str] = set()
+            mismatched: set[str] = set()
+            for num in numbers(sentence):
+                carriers = [st for st, nums in source_sentences if num in nums]
+                if not carriers:
+                    unsupported.add(num)
+                elif words and max(len(words & st) / len(words) for st in carriers) < NUMBER_CONTEXT_MIN:
+                    mismatched.add(num)  # la cifra existe, pero en otro contexto distinto al que afirma el borrador
+            if unsupported:
                 score *= 0.3
-                findings.append(Finding("UNSUPPORTED_NUMBER", f"{len(bad_numbers)} cifra(s) de la frase {n} sin respaldo en las fuentes.", Severity.CRITICAL))
+                findings.append(Finding("UNSUPPORTED_NUMBER", f"{len(unsupported)} cifra(s) de la frase {n} sin respaldo en las fuentes.", Severity.CRITICAL))
+            if mismatched:
+                score *= 0.3
+                findings.append(Finding("NUMBER_CONTEXT_MISMATCH", f"{len(mismatched)} cifra(s) de la frase {n} aparecen en las fuentes pero en otro contexto.", Severity.CRITICAL))
             bad_entities = entities(sentence) - union_entities
             if bad_entities:
                 score *= 0.8

@@ -4,18 +4,21 @@ Se omite si no hay checkout del motor / intérprete / PostgreSQL (ver `harness.p
 from __future__ import annotations
 
 import json
-from typing import Iterator
+from dataclasses import replace
+from typing import Callable, Iterator
 
 import pytest
 
 from rag_consensus import (
     ConsensusOrchestrator,
+    ConsensusPolicy,
     GuardedAnswer,
     InMemoryAuditSink,
     RagClient,
     RagClientConfig,
     RagHttpError,
     RetrievalRequest,
+    RetrievalResponse,
     Verdict,
 )
 from rag_consensus.models import NO_ANSWER_TEXT
@@ -131,9 +134,79 @@ def test_poisoned_document_returned_by_the_engine_is_blocked(stack: EngineStack)
     assert sink.records[0].tenant_id == "acme" and "PROMPT_INJECTION_IN_CONTEXT" in sink.records[0].agents[1].finding_codes
 
 
-def test_database_outage_makes_the_engine_fail_closed_and_so_do_we(stack: EngineStack) -> None:
-    """Sin su BD de auditoría el motor no sirve fragmentos (503); el orquestador rechaza y audita con el tenant."""
+# ---------------------------------------------------------------------------------------------------------------
+# Umbrales y fail-closed sobre fragmentos REALES: la red y el motor son reales; sólo se altera el borrador/etiqueta
+# DESPUÉS de recibirlos (como haría un generador defectuoso o un motor mal configurado).
+# ---------------------------------------------------------------------------------------------------------------
+
+class Tampering:
+    """Retriever que consulta de verdad al motor y luego muta la respuesta ya parseada."""
+
+    def __init__(self, inner: RagClient, mutate: Callable[[RetrievalResponse], RetrievalResponse]) -> None:
+        self._inner, self._mutate = inner, mutate
+
+    async def retrieve(self, request: RetrievalRequest) -> RetrievalResponse:
+        return self._mutate(await self._inner.retrieve(request))
+
+
+def ask_tampered(stack: EngineStack, mutate: Callable[[RetrievalResponse], RetrievalResponse]) -> tuple[GuardedAnswer, InMemoryAuditSink]:
+    sink = InMemoryAuditSink()
+
+    async def go2() -> GuardedAnswer:
+        async with RagClient(RagClientConfig(base_url=stack.url, api_key=stack.keys["acme"], timeout_s=15.0)) as client:
+            return await ConsensusOrchestrator(Tampering(client, mutate), audit=sink).answer(RetrievalRequest("acme", QUESTION, top_k=3))
+
+    return run(go2()), sink
+
+
+def scores(out: GuardedAnswer) -> dict[str, float]:
+    return {a.agent: a.score for a in out.decision.assessments}
+
+
+def test_scores_on_real_data_clear_every_threshold(stack: EngineStack) -> None:
+    out, _ = ask(stack, "acme", QUESTION)
+    s, policy = scores(out), ConsensusPolicy()
+    assert out.approved and set(s) == set(policy.required_agents)
+    for agent, score in s.items():
+        assert score >= policy.min_scores[agent], (agent, score)  # unanimidad: cada agente supera SU mínimo
+    assert s["tenant_security_auditor"] == 1.0 and s["hallucination_critic"] >= 0.9
+    assert out.decision.aggregate_score >= policy.aggregate_threshold and not out.decision.reasons
+
+
+def test_hallucinated_draft_over_real_fragments_is_blocked_by_the_critic(stack: EngineStack) -> None:
+    out, sink = ask_tampered(stack, lambda r: replace(r, draft_answer="El plazo de devolución de los pedidos es de 90 días desde la entrega. [1]"))
+    assert out.verdict is Verdict.REJECTED and out.answer is None
+    assert any(x.startswith("BELOW_MIN:hallucination_critic") for x in out.decision.reasons)
+    assert scores(out)["hallucination_critic"] < ConsensusPolicy().min_scores["hallucination_critic"]
+    assert "NUMBER_CONTEXT_MISMATCH" in sink.records[0].agents[0].finding_codes and sink.records[0].tenant_id == "acme"
+
+
+def test_self_contradicting_draft_over_real_fragments_is_blocked_by_coherence(stack: EngineStack) -> None:
+    contradiction = "El plazo de devolución de los pedidos es de 30 días desde la entrega. El plazo de devolución de los pedidos no es de 30 días desde la entrega."
+    out, _ = ask_tampered(stack, lambda r: replace(r, draft_answer=contradiction))
+    assert out.verdict is Verdict.REJECTED and out.answer is None
+    assert any(x.startswith("BELOW_MIN:coherence_validator") for x in out.decision.reasons)
+    assert scores(out)["tenant_security_auditor"] == 1.0  # los otros dos agentes aprueban: basta uno para bloquear
+
+
+def test_relabelled_tenant_over_real_fragments_is_vetoed_by_the_tenant_auditor(stack: EngineStack) -> None:
+    out, _ = ask_tampered(stack, lambda r: replace(r, tenant_id="globex", chunks=tuple(replace(c, tenant_id="globex") for c in r.chunks)))
+    assert out.verdict is Verdict.REJECTED and out.answer is None and "VETO:tenant_security_auditor" in out.decision.reasons
+    assert scores(out)["tenant_security_auditor"] == 0.0
+
+
+def test_engine_request_id_correlates_both_audit_trails(stack: EngineStack) -> None:
+    out, sink = ask(stack, "acme", QUESTION)
+    rid = sink.records[0].engine_request_id
+    assert out.approved and rid is not None and len(rid) == 36  # uuid del motor (cabecera X-Request-Id)
+    assert json.loads(sink.records[0].to_json())["engine"]["request_id"] == rid
+
+
+def test_zz_database_outage_makes_the_engine_fail_closed_and_so_do_we(stack: EngineStack) -> None:
+    """DESTRUCTIVA: debe ser la última del módulo (mata la BD). Sin su BD de auditoría el motor no sirve fragmentos (503)."""
     stack.kill_database()
     out, sink = ask(stack, "acme", QUESTION)
     assert out.verdict is Verdict.REJECTED and out.answer is None and out.error_code == "RAG_HTTP"
     assert [(r.tenant_id, r.verdict, r.error_code) for r in sink.records] == [("acme", Verdict.REJECTED, "RAG_HTTP")]
+    rec = sink.records[0]
+    assert (rec.engine_http_status, rec.engine_error) == (503, "database_unavailable") and rec.engine_request_id is not None
