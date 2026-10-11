@@ -1,0 +1,252 @@
+import { BeforeApplicationShutdown, Inject, Injectable, OnModuleInit } from '@nestjs/common';
+import { randomUUID } from 'crypto';
+import { AGENT_IDS, PullRequestContext } from '../../../agents/protocol';
+import { AppConfig } from '../config';
+import { EVENT_BUS, EventBus, streams } from '../bus/event_bus';
+import { DebateStore, STORE } from '../store/store';
+import { DebateRecord, DebateResult, DebateStatus, HumanResolution, StoredEvent } from '../types';
+import { CONFIG } from '../tokens';
+import { DebateAborted, DebateEngine } from './debate_engine';
+import { filterDiff } from './diff_filter';
+import { RepoSettings } from './pr_input';
+import { Metrics } from './metrics';
+import { renderMinutes } from './minutes';
+
+export class NotFoundError extends Error {}
+export class ConflictError extends Error {}
+export class ValidationError extends Error {}
+
+@Injectable()
+export class DebateService implements OnModuleInit, BeforeApplicationShutdown {
+  private readonly running = new Map<string, Promise<DebateRecord>>();
+
+  constructor(
+    @Inject(CONFIG) private readonly config: AppConfig,
+    @Inject(EVENT_BUS) private readonly bus: EventBus,
+    @Inject(STORE) private readonly store: DebateStore,
+    private readonly counters: Metrics,
+  ) {}
+
+  /** Debate en curso por PR: un push nuevo cancela el anterior (su resultado ya no aplica al commit vigente). */
+  private readonly activeByPr = new Map<string, { id: string; sha: string; ctrl: AbortController }>();
+  private slots = 0;
+  private readonly waiters: (() => void)[] = [];
+
+  private async acquire(): Promise<void> {
+    if (this.slots < this.config.maxConcurrentDebates) {
+      this.slots++;
+      return;
+    }
+    this.counters.debateQueued(1);
+    await new Promise<void>((r) => this.waiters.push(r));
+    this.counters.debateQueued(-1);
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) next(); // el hueco pasa directamente al siguiente
+    else this.slots--;
+  }
+
+  /** Debates que quedaron "running" por un reinicio se marcan como error (el gatekeeper falla cerrado y puede reenviar). */
+  async onModuleInit(): Promise<void> {
+    for (const r of await this.store.listRecent(500)) {
+      if (r.status === 'running' && !this.running.has(r.id)) {
+        await this.store.saveDebate({ ...r, status: 'error', reason: 'Debate interrumpido por reinicio del orquestador.', finishedAt: new Date().toISOString() });
+      }
+    }
+  }
+
+  /** Drena los debates en curso (máx. 30 s) antes de cerrar bus y almacén. */
+  async beforeApplicationShutdown(): Promise<void> {
+    await Promise.race([Promise.allSettled([...this.running.values()]), new Promise((r) => setTimeout(r, 30_000))]);
+  }
+
+  /** Crea (o reutiliza) el debate de un PR en un commit concreto y lo ejecuta en segundo plano. */
+  async submit(pr: PullRequestContext, opts: { force?: boolean; settings?: RepoSettings } = {}): Promise<DebateRecord> {
+    if (!opts.force) {
+      const existing = await this.store.findByPrAndSha(pr.id, pr.headSha);
+      if (existing && existing.status !== 'error' && existing.status !== 'superseded') return existing;
+    }
+    const id = randomUUID();
+    const rec: DebateRecord = {
+      id,
+      prId: pr.id,
+      provider: pr.provider,
+      repo: pr.repo,
+      prNumber: pr.number,
+      headSha: pr.headSha,
+      title: pr.title,
+      status: 'running',
+      decision: null,
+      reason: null,
+      rounds: 0,
+      convergence: null,
+      result: null,
+      minutes: null,
+      createdAt: new Date().toISOString(),
+      finishedAt: null,
+    };
+    await this.store.saveDebate(rec);
+    const prev = this.activeByPr.get(pr.id);
+    if (prev && prev.sha !== pr.headSha) prev.ctrl.abort();
+    const ctrl = new AbortController();
+    this.activeByPr.set(pr.id, { id, sha: pr.headSha, ctrl });
+    const p = this.execute(rec, pr, opts.settings ?? {}, ctrl.signal).finally(() => {
+      this.running.delete(id);
+      if (this.activeByPr.get(pr.id)?.id === id) this.activeByPr.delete(pr.id);
+    });
+    this.running.set(id, p);
+    p.catch(() => undefined);
+    return rec;
+  }
+
+  private async execute(rec: DebateRecord, pr: PullRequestContext, settings: RepoSettings, signal: AbortSignal): Promise<DebateRecord> {
+    await this.acquire();
+    this.counters.debateRunning(1);
+    try {
+      return await this.executeNow(rec, pr, settings, signal);
+    } finally {
+      this.counters.debateRunning(-1);
+      this.release();
+    }
+  }
+
+  private async executeNow(rec: DebateRecord, basePr: PullRequestContext, settings: RepoSettings, signal: AbortSignal): Promise<DebateRecord> {
+    const emit = async (type: string, payload: Record<string, unknown>) => {
+      const at = new Date().toISOString();
+      if (type === 'agent.fault') this.counters.fault(String(payload.kind));
+      await this.store.appendEvent(rec.id, type, payload, at);
+      if (type === 'round.evaluated') {
+        await this.store.saveMetric({
+          debateId: rec.id,
+          round: payload.round as number,
+          convergence: payload.convergence as number,
+          approvals: payload.approvals as number,
+          rejections: payload.rejections as number,
+          outcome: payload.outcome as string,
+        });
+      }
+      await this.bus.publish(streams.debateEvents(rec.id), { type, at, ...payload });
+    };
+    try {
+      const { diff, ignored } = filterDiff(basePr.diff, settings.ignorePaths ?? []);
+      const pr: PullRequestContext = { ...basePr, diff, settings: settings.monthlyBudgetUsd ? { monthlyBudgetUsd: settings.monthlyBudgetUsd } : undefined };
+      if (ignored.length) await emit('diff.filtered', { ignored });
+      const engine = new DebateEngine({
+        bus: this.bus,
+        busSecret: this.config.busSecret,
+        agents: [...AGENT_IDS],
+        policy: { ...this.config.policy, maxRounds: settings.maxRounds ?? this.config.policy.maxRounds },
+        agentTimeoutMs: this.config.agentTimeoutMs,
+      });
+      const result = await engine.run(rec.id, pr, emit, signal);
+      await this.expireStreams(rec.id);
+      const done: DebateRecord = {
+        ...rec,
+        status: statusOf(result),
+        decision: result.decision,
+        reason: result.reason,
+        rounds: result.rounds.length,
+        convergence: result.convergence.final,
+        result,
+        minutes: renderMinutes(result),
+        finishedAt: result.finishedAt,
+      };
+      await this.store.saveDebate(done);
+      this.counters.debateFinished(result.decision, result.rounds.length, result.convergence.final);
+      return done;
+    } catch (e) {
+      await this.expireStreams(rec.id);
+      if (e instanceof DebateAborted) {
+        const sup: DebateRecord = { ...rec, status: 'superseded', reason: 'Reemplazado por un commit más reciente del mismo PR.', finishedAt: new Date().toISOString() };
+        await this.store.saveDebate(sup);
+        await this.store.appendEvent(rec.id, 'debate.superseded', {}, sup.finishedAt!);
+        this.counters.debateFinished('SUPERSEDED', 0, 0);
+        return sup;
+      }
+      const failed: DebateRecord = { ...rec, status: 'error', reason: `Error del orquestador: ${(e as Error).message}`, finishedAt: new Date().toISOString() };
+      await this.store.saveDebate(failed);
+      this.counters.debateFinished('ERROR', 0, 0);
+      await this.store.appendEvent(rec.id, 'debate.error', { message: (e as Error).message }, failed.finishedAt!);
+      return failed;
+    }
+  }
+
+  private async expireStreams(id: string): Promise<void> {
+    try {
+      await this.bus.expire(streams.debateResponses(id), this.config.streamTtlSeconds);
+      await this.bus.expire(streams.debateEvents(id), this.config.streamTtlSeconds);
+    } catch {
+      /* la retención es best-effort */
+    }
+  }
+
+  async get(id: string, waitMs = 0): Promise<DebateRecord> {
+    const pending = this.running.get(id);
+    if (pending && waitMs > 0) {
+      await Promise.race([pending.catch(() => undefined), new Promise((r) => setTimeout(r, Math.min(waitMs, 120_000)))]);
+    }
+    const rec = await this.store.getDebate(id);
+    if (!rec) throw new NotFoundError(`debate ${id} no existe`);
+    return rec;
+  }
+
+  async minutes(id: string): Promise<string> {
+    const rec = await this.get(id);
+    if (!rec.minutes) throw new NotFoundError('la minuta aún no está disponible');
+    return rec.minutes;
+  }
+
+  async events(id: string): Promise<StoredEvent[]> {
+    await this.get(id);
+    return this.store.listEvents(id);
+  }
+
+  async metrics(id: string) {
+    await this.get(id);
+    return this.store.listMetrics(id);
+  }
+
+  recent(limit: number) {
+    return this.store.listRecent(limit);
+  }
+
+  history(prId: string) {
+    return this.store.listByPr(prId, 100);
+  }
+
+  /** Un ingeniero senior resuelve un debate escalado. */
+  async resolve(id: string, input: { reviewer?: unknown; decision?: unknown; rationale?: unknown }): Promise<DebateRecord> {
+    if (typeof input.reviewer !== 'string' || !input.reviewer.trim()) throw new ValidationError('reviewer es obligatorio');
+    if (input.decision !== 'approve' && input.decision !== 'reject') throw new ValidationError("decision debe ser 'approve' o 'reject'");
+    if (typeof input.rationale !== 'string' || !input.rationale.trim()) throw new ValidationError('rationale es obligatorio');
+    const rec = await this.get(id);
+    if (rec.status !== 'escalated' || !rec.result) throw new ConflictError(`el debate está en estado '${rec.status}', no 'escalated'`);
+    const resolution: HumanResolution = {
+      reviewer: input.reviewer.trim().slice(0, 200),
+      decision: input.decision,
+      rationale: input.rationale.trim().slice(0, 2000),
+      at: new Date().toISOString(),
+    };
+    const result: DebateResult = {
+      ...rec.result,
+      resolution,
+      verdict: resolution.decision === 'approve' ? 'APPROVED' : 'REJECTED',
+    };
+    const updated: DebateRecord = {
+      ...rec,
+      status: resolution.decision === 'approve' ? 'resolved_approved' : 'resolved_rejected',
+      result,
+      minutes: renderMinutes(result),
+    };
+    await this.store.saveDebate(updated);
+    await this.store.appendEvent(id, 'debate.resolved', { ...resolution }, resolution.at);
+    await this.bus.publish(streams.debateEvents(id), { type: 'debate.resolved', ...resolution });
+    return updated;
+  }
+}
+
+function statusOf(r: DebateResult): DebateStatus {
+  return r.decision === 'APPROVED' ? 'approved' : r.decision === 'REJECTED' ? 'rejected' : 'escalated';
+}

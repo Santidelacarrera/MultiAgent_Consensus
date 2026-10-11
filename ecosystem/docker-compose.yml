@@ -1,0 +1,351 @@
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+#  "Segundo Cerebro" — stack E2E unificado y aislado (local)
+#
+#    cp .env.example .env && ./scripts/gen_secrets.sh      # genera secretos aleatorios
+#    ./scripts/run_e2e_stack.sh                             # levanta, espera salud y ejecuta las pruebas E2E
+#
+#  Topología de red (Docker "internal" = sin salida a Internet ni al host):
+#
+#    host ──127.0.0.1:8080──▶ [edge]  shadowapi-guard ──[internal]──▶ consensus-service ──▶ contextrag-engine
+#                                                                  └──▶ (redis)                 ├──▶ qdrant   [data]
+#                              nexusflow-engine · docmind-api · cloudcost-api  ──[internal]       ├──▶ postgres [data]
+#                                                                                                 └──▶ redis    [data]
+#  Sólo `shadowapi-guard` publica un puerto (en 127.0.0.1). Bases de datos y colas viven en `data`, accesibles
+#  únicamente por los servicios que las usan.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════════════════
+name: segundo-cerebro
+
+x-hardening: &hardening
+  init: true
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  pids_limit: 512
+
+networks:
+  edge:       # única red con puente al host: sólo el gateway perimetral
+    driver: bridge
+  internal:   # tráfico servicio↔servicio; sin salida a Internet
+    driver: bridge
+    internal: true
+  data:       # PostgreSQL · Qdrant · Redis; sin salida a Internet
+    driver: bridge
+    internal: true
+
+volumes:
+  pg_data:
+  qdrant_data:
+  redis_data:
+  nexusflow_data:
+  docmind_documents:
+  generated:        # claves derivadas (sólo hashes) que generan `secrets-init`
+
+services:
+  # ───────────────────────────────────────────────── bootstrap de credenciales (one-shot) ──────────────────────
+  secrets-init:
+    image: python:3.12-alpine
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: []                       # no necesita red
+    network_mode: none
+    environment:
+      ACME_CLIENT_API_KEY: ${ACME_CLIENT_API_KEY:?}
+      GLOBEX_CLIENT_API_KEY: ${GLOBEX_CLIENT_API_KEY:?}
+      ACME_RAG_READER_KEY: ${ACME_RAG_READER_KEY:?}
+      GLOBEX_RAG_READER_KEY: ${GLOBEX_RAG_READER_KEY:?}
+      ACME_RAG_ADMIN_KEY: ${ACME_RAG_ADMIN_KEY:?}
+      GLOBEX_RAG_ADMIN_KEY: ${GLOBEX_RAG_ADMIN_KEY:?}
+    volumes:
+      - ./init/bootstrap.py:/bootstrap.py:ro
+      - generated:/out
+    command: ["python", "/bootstrap.py", "/out"]
+
+  # ───────────────────────────────────────────────────────────── datos ────────────────────────────────────────
+  postgres:
+    <<: *hardening
+    cap_drop: []                       # la imagen oficial necesita chown/setuid al inicializar el volumen
+    security_opt: ["no-new-privileges:true"]
+    image: pgvector/pgvector:pg16      # PostgreSQL 16 + pgvector (ContextRAG); RLS nativa
+    networks: [data]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      POSTGRES_DB: postgres
+      CONTEXTRAG_OWNER_PASSWORD: ${CONTEXTRAG_OWNER_PASSWORD:?}
+      CONTEXTRAG_APP_PASSWORD: ${CONTEXTRAG_APP_PASSWORD:?}
+      CLOUDCOST_OWNER_PASSWORD: ${CLOUDCOST_OWNER_PASSWORD:?}
+      DOCMIND_DB_PASSWORD: ${DOCMIND_DB_PASSWORD:?}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro       # sólo se ejecuta al inicializar el volumen
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres -h 127.0.0.1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  qdrant:
+    <<: *hardening
+    image: qdrant/qdrant:v1.12.4
+    networks: [data]
+    volumes: [qdrant_data:/qdrant/storage]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    # Aislamiento por tenant_id: lo imponen los CLIENTES (filtro de payload obligatorio en ContextRAG y DocMind). Qdrant OSS
+    # no tiene RBAC por tenant; por eso sólo es alcanzable desde la red `data`, sin puerto publicado. Ver README §Límites.
+
+  redis:
+    <<: *hardening
+    image: redis:7-alpine
+    networks: [data]
+    environment:
+      REDIS_PASSWORD_CONTEXTRAG: ${REDIS_PASSWORD_CONTEXTRAG:?}
+      REDIS_PASSWORD_CONSENSUS: ${REDIS_PASSWORD_CONSENSUS:?}
+      REDIS_PASSWORD_DOCMIND: ${REDIS_PASSWORD_DOCMIND:?}
+      REDIS_PASSWORD_CLOUDCOST: ${REDIS_PASSWORD_CLOUDCOST:?}
+      REDIS_PASSWORD_ADMIN: ${REDIS_PASSWORD_ADMIN:?}
+    volumes:
+      - redis_data:/data
+      - ./redis/entrypoint.sh:/entrypoint.sh:ro
+    user: redis
+    entrypoint: ["sh", "/entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --user admin -a \"$$REDIS_PASSWORD_ADMIN\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # ──────────────────────────────────────────────────────── servicios ─────────────────────────────────────────
+  contextrag-engine:                    # Motor RAG: recuperación híbrida, auditoría particionada con RLS
+    <<: *hardening
+    build:
+      context: ${CONTEXTRAG_CONTEXT:-https://github.com/Santidelacarrera/ContextRAG_Engine.git#${CONTEXTRAG_REF:-claude/tender-cray-4zua6u}}
+      dockerfile: deploy/Dockerfile
+    networks: [internal, data]
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      POSTGRES_DSN: postgresql://contextrag_app:${CONTEXTRAG_APP_PASSWORD}@postgres:5432/contextrag      # rol sin BYPASSRLS
+      POSTGRES_ADMIN_DSN: postgresql://contextrag:${CONTEXTRAG_OWNER_PASSWORD}@postgres:5432/contextrag   # propietario: sólo DDL/particiones
+      REDIS_URL: redis://contextrag:${REDIS_PASSWORD_CONTEXTRAG}@redis:6379/0
+      CONTEXTRAG_KEYS_FILE: /run/generated/contextrag-keys.json     # claves ligadas a tenant (sólo hashes)
+      CONTEXTRAG_RATE_LIMIT_PER_MIN: ${CONTEXTRAG_RATE_LIMIT_PER_MIN:-600}
+      MASTER_KEY: ${CONTEXTRAG_MASTER_KEY:?}                         # cifra el texto de los chunks en reposo, por tenant
+      BM25: incremental
+      EMBEDDER: ${EMBEDDER:-hashing}
+      RERANKER: ${RERANKER:-lexical}
+      NLI: ${NLI:-lexical}
+      LLM: ${RAG_LLM:-extractive}
+    volumes: [generated:/run/generated:ro]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      qdrant: {condition: service_healthy}
+      redis: {condition: service_healthy}
+
+  consensus-service:                    # Answer Gate: comité de 3 agentes sobre cada respuesta del RAG (fail-closed)
+    <<: *hardening
+    build:
+      context: ${CONSENSUS_CONTEXT:-..}
+      dockerfile: rag_consensus/Dockerfile.service
+    networks: [internal, data]
+    environment:
+      GUARD_SIGNING_KEY: ${GUARD_SIGNING_KEY:?}
+      CONTEXTRAG_URL: http://contextrag-engine:8000
+      CONTEXTRAG_ALLOW_INSECURE_HTTP: "true"                         # red interna sin TLS (no hay terminación TLS dentro del stack)
+      CONTEXTRAG_TENANT_KEYS_JSON: '{"acme":"${ACME_RAG_READER_KEY}","globex":"${GLOBEX_RAG_READER_KEY}"}'
+      SERVICE_TOKEN: ${DOWNSTREAM_TOKEN:?}                           # ruta interna /v1/consensus (NexusFlow)
+      REDIS_URL: redis://consensus:${REDIS_PASSWORD_CONSENSUS}@redis:6379/0
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    read_only: true
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8090/readyz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      redis: {condition: service_healthy}
+      contextrag-engine: {condition: service_healthy}
+
+  shadowapi-guard:                      # Gateway perimetral / WAF: ÚNICO servicio con puerto publicado
+    <<: *hardening
+    build:
+      context: ${SHADOWAPI_CONTEXT:-https://github.com/Santidelacarrera/ShadowAPI_Guard.git#${SHADOWAPI_REF:-claude/beautiful-goodall-u52sn1}:edge-gateway}
+    networks: [edge, internal]
+    environment:
+      GUARD_SIGNING_KEY: ${GUARD_SIGNING_KEY:?}
+      GUARD_JWT_SECRET: ${GUARD_JWT_SECRET:?}
+      GUARD_ADMIN_API_KEY: ${GUARD_ADMIN_API_KEY:?}
+      GUARD_TENANTS_FILE: /run/generated/tenants.json
+      GUARD_UPSTREAM_RAG: http://consensus-service:8090            # /v1/rag/query pasa SIEMPRE por el comité
+      GUARD_UPSTREAM_CONSENSUS: http://consensus-service:8090
+      GUARD_BLOCK_THRESHOLD: ${GUARD_BLOCK_THRESHOLD:-7}
+    volumes: [generated:/run/generated:ro]
+    ports: ["127.0.0.1:${GATEWAY_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      secrets-init: {condition: service_completed_successfully}
+      consensus-service: {condition: service_healthy}
+
+  nexusflow-engine:                     # Orquestador de workflows (DAG, reintentos, rutas alternativas, saga)
+    <<: *hardening
+    build:
+      context: ${NEXUSFLOW_CONTEXT:-https://github.com/Santidelacarrera/NexusFlow-AI.git#${NEXUSFLOW_REF:-main}}
+      dockerfile: services/orchestrator/Dockerfile
+    networks: [internal]
+    environment:
+      ORCHESTRATOR_TOKEN: ${ORCHESTRATOR_TOKEN:?}
+      DOWNSTREAM_TOKEN: ${DOWNSTREAM_TOKEN:?}
+      ORCHESTRATOR_DB: /data/orchestrator.db
+      MAX_ACTIVE_RUNS_PER_TENANT: "20"
+      CONTEXT_RAG_URL: http://contextrag-engine:8000
+      CONSENSUS_URL: http://consensus-service:8090
+      DOCUMENT_PARSER_URL: http://docmind-api:8000
+      # Sin servicio que los implemente todavía: host inexistente a propósito (falla cerrado en vez de simular éxito).
+      ESCALATION_URL: http://escalation.unprovisioned.invalid
+      DELIVERY_URL: http://delivery.unprovisioned.invalid
+    volumes: [nexusflow_data:/data]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8002/healthz', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    depends_on:
+      contextrag-engine: {condition: service_healthy}
+      consensus-service: {condition: service_healthy}
+
+  docmind-storage-init:                 # permisos del volumen de documentos (one-shot)
+    image: alpine:3.21
+    restart: "no"
+    network_mode: none
+    command: ["sh", "-c", "mkdir -p /data/documents && chown -R 1000:1000 /data/documents && chmod 700 /data/documents"]
+    volumes: [docmind_documents:/data/documents]
+
+  docmind-api:                          # Ingesta segura de documentos (extracción, OCR, validación, PII)
+    <<: *hardening
+    build:
+      context: ${DOCMIND_CONTEXT:-https://github.com/Santidelacarrera/DOCMIND_AI.git#${DOCMIND_REF:-claude/eager-planck-v6esv9}:backend}
+    networks: [internal, data]
+    environment: &docmind-env
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+psycopg://docmind:${DOCMIND_DB_PASSWORD}@postgres:5432/docmind
+      REDIS_URL: redis://docmind:${REDIS_PASSWORD_DOCMIND}@redis:6379/0
+      STORAGE_PROVIDER: local
+      LOCAL_STORAGE_PATH: /data/documents
+      JWT_SECRET: ${DOCMIND_JWT_SECRET:?}
+      PII_MASKING_KEY: ${DOCMIND_PII_MASKING_KEY:?}
+      COOKIE_SECURE: "false"                                         # HTTP local; en un entorno real: true + TLS
+      CSRF_ENABLED: "true"
+      CORS_ORIGINS: http://localhost:3000
+      LLM_PROVIDER: mock                                             # sin red: salida determinista
+      ANTIVIRUS_PROVIDER: disabled                                   # en staging/producción: clamav obligatorio
+      LOG_FORMAT: json
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log"]
+    volumes: [docmind_documents:/data/documents]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      docmind-storage-init: {condition: service_completed_successfully}
+
+  docmind-worker:                       # procesa los trabajos de docmind-api (Celery)
+    <<: *hardening
+    build:
+      context: ${DOCMIND_CONTEXT:-https://github.com/Santidelacarrera/DOCMIND_AI.git#${DOCMIND_REF:-claude/eager-planck-v6esv9}:backend}
+    networks: [internal, data]
+    environment: *docmind-env
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO"]
+    volumes: [docmind_documents:/data/documents]
+    depends_on:
+      docmind-api: {condition: service_healthy}
+
+  cloudcost-migrate:                    # migraciones + rol de aplicación sin superusuario ni BYPASSRLS (one-shot)
+    build:
+      context: ${CLOUDCOST_CONTEXT:-https://github.com/Santidelacarrera/CloudCost_Optimizer_FinOps_Guardrail.git#${CLOUDCOST_REF:-claude/busy-clarke-hnv1on}}
+      dockerfile: infrastructure/docker/migrate.Dockerfile
+    restart: "no"
+    networks: [data]
+    environment:
+      DATABASE_ADMIN_URL: postgresql://cloudcost_owner:${CLOUDCOST_OWNER_PASSWORD}@postgres:5432/cloudcost
+      APP_DB_PASSWORD: ${CLOUDCOST_APP_PASSWORD:?}
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  cloudcost-api:                        # Guardrails FinOps (presupuestos, políticas OPA) y métricas
+    <<: *hardening
+    build:
+      context: ${CLOUDCOST_CONTEXT:-https://github.com/Santidelacarrera/CloudCost_Optimizer_FinOps_Guardrail.git#${CLOUDCOST_REF:-claude/busy-clarke-hnv1on}}
+      dockerfile: apps/api/Dockerfile
+    networks: [internal, data]
+    environment:
+      ENV: development
+      DATABASE_URL: postgresql://cloudcost_app:${CLOUDCOST_APP_PASSWORD}@postgres:5432/cloudcost
+      REDIS_URL: redis://cloudcost:${REDIS_PASSWORD_CLOUDCOST}@redis:6379/0
+      AUTH_MODE: local
+      AUTH_LOCAL_ENABLED: "true"
+      AUTH_SIGNUP_OPEN: "false"
+      JWT_SECRET: ${CLOUDCOST_JWT_SECRET:?}
+      AUTH_PEPPER: ${CLOUDCOST_AUTH_PEPPER:?}
+      AUTH_TRUST_FORWARDED: "false"
+      DEMO_ENABLED: "false"
+      LLM_ENABLED: "false"
+      PASSKEYS_ENABLED: "false"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/ready', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      cloudcost-migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  # ─────────────────────────────────────────────────── pruebas E2E (perfil `e2e`) ──────────────────────────────
+  e2e:
+    profiles: [e2e]
+    build: ./e2e
+    restart: "no"
+    networks: [internal]                # dentro del stack: alcanza los servicios por nombre; NO tiene salida a Internet
+    environment:
+      GATEWAY_URL: http://shadowapi-guard:8080
+      CONTEXTRAG_URL: http://contextrag-engine:8000
+      CONSENSUS_URL: http://consensus-service:8090
+      NEXUSFLOW_URL: http://nexusflow-engine:8002
+      DOCMIND_URL: http://docmind-api:8000
+      CLOUDCOST_URL: http://cloudcost-api:8000
+      ACME_CLIENT_API_KEY: ${ACME_CLIENT_API_KEY:?}
+      GLOBEX_CLIENT_API_KEY: ${GLOBEX_CLIENT_API_KEY:?}
+      ACME_RAG_ADMIN_KEY: ${ACME_RAG_ADMIN_KEY:?}
+      GLOBEX_RAG_ADMIN_KEY: ${GLOBEX_RAG_ADMIN_KEY:?}
+      ORCHESTRATOR_TOKEN: ${ORCHESTRATOR_TOKEN:?}
+      DOWNSTREAM_TOKEN: ${DOWNSTREAM_TOKEN:?}
+      GUARD_SIGNING_KEY: ${GUARD_SIGNING_KEY:?}                       # para forjar peticiones y comprobar que se rechazan
+      STRICT_CONTRACTS: ${STRICT_CONTRACTS:-false}
+    depends_on:
+      shadowapi-guard: {condition: service_healthy}
+      nexusflow-engine: {condition: service_healthy}
+      docmind-api: {condition: service_healthy}
+      cloudcost-api: {condition: service_healthy}

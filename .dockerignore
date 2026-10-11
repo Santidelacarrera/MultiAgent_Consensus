@@ -1,0 +1,8 @@
+node_modules
+dist
+coverage
+.git
+.env
+**/__pycache__
+**/.pytest_cache
+gatekeeper/tests

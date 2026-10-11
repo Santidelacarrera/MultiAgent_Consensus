@@ -1,0 +1,102 @@
+# MultiAgent Consensus — stack completo: Redis (bus de eventos) + PostgreSQL (minutas, logs, métricas)
+# + orquestador (NestJS) + gatekeeper (FastAPI).
+#
+#   cp .env.example .env   # y rellena los secretos
+#   docker compose up --build
+#   docker compose --profile ollama up --build   # además un LLM local (Ollama)
+name: multiagent-consensus
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-consensus}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?define POSTGRES_PASSWORD en .env}
+      POSTGRES_DB: ${POSTGRES_DB:-consensus}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      # Esquema inicial; el orquestador además lo aplica de forma idempotente al arrancar.
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    environment:
+      PORT: "3000"
+      BUS_BACKEND: redis
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgres://${POSTGRES_USER:-consensus}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-consensus}
+      BUS_SECRET: ${BUS_SECRET:?define BUS_SECRET en .env}
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY:?define ORCHESTRATOR_API_KEY en .env}
+      MAX_ROUNDS: ${MAX_ROUNDS:-3}
+      MAX_CONCURRENT_DEBATES: ${MAX_CONCURRENT_DEBATES:-4}
+      VETO_ON_CRITICAL: ${VETO_ON_CRITICAL:-true}
+      MONTHLY_BUDGET_USD: ${MONTHLY_BUDGET_USD:-1000}
+      AGENT_TIMEOUT_MS: ${AGENT_TIMEOUT_MS:-120000}
+      # Capa LLM opcional: none | claude | ollama (sin LLM los agentes usan su análisis estático)
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-claude-sonnet-5-5}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${ORCHESTRATOR_PORT:-3000}:3000"
+    restart: unless-stopped
+
+  gatekeeper:
+    build: ./gatekeeper
+    environment:
+      ORCHESTRATOR_URL: http://orchestrator:3000
+      ORCHESTRATOR_API_KEY: ${ORCHESTRATOR_API_KEY}
+      ORCHESTRATOR_PUBLIC_URL: ${ORCHESTRATOR_PUBLIC_URL:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      GITLAB_WEBHOOK_TOKEN: ${GITLAB_WEBHOOK_TOKEN:-}
+      GITLAB_API_URL: ${GITLAB_API_URL:-https://gitlab.com/api/v4}
+      GATEKEEPER_AUTO_MERGE: ${GATEKEEPER_AUTO_MERGE:-false}
+      GATEKEEPER_REQUEST_CHANGES: ${GATEKEEPER_REQUEST_CHANGES:-false}
+      GATEKEEPER_SENIOR_REVIEWERS: ${GATEKEEPER_SENIOR_REVIEWERS:-}
+      DEBATE_TIMEOUT_S: ${DEBATE_TIMEOUT_S:-900}
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    ports:
+      - "${GATEKEEPER_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-data:/root/.ollama
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  pg-data:
+  ollama-data:
