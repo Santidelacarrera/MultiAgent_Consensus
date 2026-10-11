@@ -1,4 +1,5 @@
 import { Controller, Get, Header, UseGuards } from '@nestjs/common';
+import { DASHBOARD_HTML } from './dashboard.html';
 import { Metrics } from '../debate/metrics';
 import { ApiKeyGuard } from './api_key.guard';
 
@@ -9,6 +10,14 @@ export class HealthController {
   @Get('health')
   health() {
     return { status: 'ok', service: 'multiagent-consensus-orchestrator' };
+  }
+
+  /** HTML estático sin datos; los datos se piden a /v1/debates/recent con la API key. */
+  @Get('dashboard')
+  @Header('content-type', 'text/html; charset=utf-8')
+  @Header('content-security-policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+  dashboard() {
+    return DASHBOARD_HTML;
   }
 
   @Get('metrics')

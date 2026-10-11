@@ -33,7 +33,7 @@ export class Metrics {
       L.push(`# HELP ${name} ${help}`, `# TYPE ${name} counter`);
       for (const [labels, v] of rows) L.push(`${name}${labels} ${v}`);
     };
-    counter('consensus_debates_total', 'Debates concluidos por decisión', ['APPROVED', 'REJECTED', 'ESCALATED', 'ERROR'].map((d) => [`{decision="${d}"}`, this.decisions.get(d) ?? 0]));
+    counter('consensus_debates_total', 'Debates concluidos por decisión', ['APPROVED', 'REJECTED', 'ESCALATED', 'ERROR', 'SUPERSEDED'].map((d) => [`{decision="${d}"}`, this.decisions.get(d) ?? 0]));
     counter('consensus_agent_faults_total', 'Agentes expulsados por tipo de fallo', ['timeout', 'invalid', 'bad_signature', 'equivocation', 'error'].map((k) => [`{kind="${k}"}`, this.faults.get(k) ?? 0]));
     counter('consensus_rounds_total', 'Rondas de debate acumuladas', [['', this.rounds]]);
     L.push('# HELP consensus_convergence_avg Convergencia final media', '# TYPE consensus_convergence_avg gauge', `consensus_convergence_avg ${this.debates ? (this.convergenceSum / this.debates).toFixed(4) : 0}`);

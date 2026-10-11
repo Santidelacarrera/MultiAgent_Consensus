@@ -99,6 +99,11 @@ class GateService:
 
     def publish(self, ref: PrRef, vcs: VcsClient, view: dict[str, Any]) -> Verdict:
         """Convierte el resultado del debate en acciones: minuta, estado, bloqueo y/o merge."""
+        if view.get("status") == "superseded":
+            # Llegó un commit más reciente: este resultado ya no aplica. No se toca la minuta ni se fusiona.
+            verdict = Verdict("failure", "Reemplazado por un commit más reciente.")
+            vcs.set_status(ref, verdict.state, verdict.description)
+            return verdict
         verdict = decide(view)
         debate_id = view.get("id")
         target = None

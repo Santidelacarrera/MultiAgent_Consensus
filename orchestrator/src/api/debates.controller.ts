@@ -11,7 +11,7 @@ export function toView(rec: DebateRecord, full = false) {
   const { result, ...rest } = rec;
   return {
     ...rest,
-    verdict: result?.verdict ?? (rec.status === 'running' ? 'PENDING' : rec.status === 'error' ? 'ERROR' : null),
+    verdict: result?.verdict ?? (rec.status === 'running' ? 'PENDING' : rec.status === 'error' ? 'ERROR' : rec.status === 'superseded' ? 'SUPERSEDED' : null),
     summary: result
       ? {
           finalVotes: result.finalVotes,
@@ -60,6 +60,11 @@ export class DebatesController {
       if (!prId) throw new ValidationError('prId es obligatorio');
       return (await this.debates.history(prId)).map((r) => toView(r));
     });
+  }
+
+  @Get('recent')
+  recent(@Query('limit') limit?: string) {
+    return wrap(async () => (await this.debates.recent(Math.min(200, Math.max(1, Number(limit) || 50)))).map((r) => toView(r)));
   }
 
   @Get(':id')

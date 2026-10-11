@@ -1,7 +1,7 @@
 import { AgentId, AgentReview, Finding, PullRequestContext, Rebuttal, Severity, Vote } from '../../agents/protocol';
 
 export type Decision = 'APPROVED' | 'REJECTED' | 'ESCALATED';
-export type DebateStatus = 'running' | 'approved' | 'rejected' | 'escalated' | 'resolved_approved' | 'resolved_rejected' | 'error';
+export type DebateStatus = 'running' | 'approved' | 'rejected' | 'escalated' | 'resolved_approved' | 'resolved_rejected' | 'error' | 'superseded';
 
 export interface ConsensusPolicy {
   /** Rondas máximas antes de escalar a un humano. */
