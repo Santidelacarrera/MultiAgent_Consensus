@@ -1,0 +1,13 @@
+# consensus-service (Answer Gate). Contexto de build: la raíz del repositorio MultiAgent_Consensus.
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /srv
+COPY rag_consensus/pyproject.toml ./pyproject.toml
+COPY rag_consensus/src ./src
+RUN pip install ".[service]" && useradd -r -u 10001 -s /usr/sbin/nologin gate
+USER gate
+EXPOSE 8090
+ENV HOST=0.0.0.0 PORT=8090
+HEALTHCHECK --interval=5s --timeout=3s --retries=20 --start-period=5s \
+  CMD python -c "import os,urllib.request as u; u.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','8090'), timeout=2)"
+CMD ["python", "-m", "rag_consensus.service"]
