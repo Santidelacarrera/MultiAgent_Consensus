@@ -44,9 +44,11 @@ def call(method: str, url: str, *, headers: dict[str, str] | None = None, body: 
     h = {"Accept": "application/json", **(headers or {})}
     if data is not None:
         h.setdefault("Content-Type", "application/json")
-    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    if not url.startswith(("http://", "https://")):
+        return 0, {}, f"esquema no permitido: {url[:20]}"
+    req = urllib.request.Request(url, data=data, method=method, headers=h)  # noqa: S310
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
             status, text = r.status, r.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         status, text = e.code, e.read().decode("utf-8", "replace")
