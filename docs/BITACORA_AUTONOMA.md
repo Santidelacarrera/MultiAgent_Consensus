@@ -34,12 +34,13 @@ Sesión autónoma del 2026-10-12 · rama `feat/multiagent-consensus-autonomo-202
 | 2026-10-12 | El guion fija la *evidencia* (hallazgos), no el voto | el orquestador no confía en el voto declarado; el guion no debe poder saltarse esa regla |
 | 2026-10-12 | Escenarios y falsificaciones en `src/demo/` (no en `test/`) | componente reutilizable: la demo y los tests comparten el mismo catálogo |
 | 2026-10-12 | `npm run audit` omite dependencias de desarrollo | `npm audit` completo marca `braces` (alto, ReDoS) sólo vía la cadena de Jest 29; subir a Jest 30 es un cambio mayor fuera del alcance. Producción: 0 |
+| 2026-10-12 | Jest 29 → 30 (`jest@30.5.2`, `ts-jest@29.4.14`) y `npm run audit` sin `--omit=dev` | elimina el aviso alto de `braces`; 158/158 tests siguen pasando. Autorizado por Santiago junto con el merge |
 | 2026-10-12 | `# nosec B104/B310` con justificación; `assert`→`if` en `bootstrap.py` | B104: escucha dentro del contenedor sin puerto publicado; B310: sólo se admiten URLs http(s) |
 
 ## Pendientes para Santiago
 
 1. **Aprobar y fusionar el PR** (no lo hago yo).
-2. Valorar subir Jest a 30 para eliminar el aviso alto de `braces` en herramientas de desarrollo.
+2. ~~Subir Jest a 30~~ — hecho el 2026-10-12 (ver decisión): `npm audit --audit-level=high` pasa con el árbol completo; quedan avisos *moderate* sólo en herramientas de desarrollo (`sprintf-js` vía `ts-jest`).
 3. Ejecutar `ecosystem/scripts/run_e2e_stack.sh` en una máquina con Docker: las imágenes de NexusFlow/DocMind/CloudCost siguen sin construirse (ver `ecosystem/README.md`).
 4. Contratos entre repos hermanos sin alinear (NexusFlow→ContextRAG/DocMind): requieren cambios en otros proyectos, fuera de este alcance.
 5. La nota del vault del proyecto no es accesible desde esta sesión: esta bitácora es su copia; trasladarla.
