@@ -11,9 +11,13 @@
     "start:dev": "ts-node orchestrator/src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "jest --runInBand",
-    "test:py": "cd gatekeeper && python3 -m pytest -q"
+    "test:py": "cd gatekeeper && python3 -m pytest -q",
+    "demo": "ts-node orchestrator/src/demo/run_scenarios.ts",
+    "audit": "npm audit --omit=dev --audit-level=high"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@nestjs/common": "^11.1.0",
     "@nestjs/core": "^11.1.0",

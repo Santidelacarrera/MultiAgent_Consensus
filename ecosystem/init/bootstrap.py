@@ -40,7 +40,8 @@ def main(out: Path) -> None:
         if len({client, reader, admin} | seen) != 3 + len(seen):
             sys.exit("las claves deben ser distintas entre sí y entre tenants")
         seen |= {client, reader, admin}
-        assert re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", t)
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{1,31}", t):
+            sys.exit(f"identificador de tenant inválido: {t!r}")
         tenants[t] = {
             "api_keys_sha256": [sha256(client)],
             "scopes": ["rag:query", "consensus:run", "consensus:read"],
