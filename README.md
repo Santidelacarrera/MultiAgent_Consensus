@@ -507,7 +507,7 @@ Las pruebas de firma se verificaron por mutación: con `verifyResponse` forzado 
 ```bash
 npm install
 npm run typecheck
-npm run audit                # npm audit de dependencias de producción (nivel high)
+npm run audit                # npm audit (nivel high, incluye dependencias de desarrollo)
 npm run demo                 # demo E2E con agentes simulados
 npm test                     # Jest: agentes, consenso, motor de debate, API HTTP, Redis Streams real, PostgreSQL real + pg-mem
 
