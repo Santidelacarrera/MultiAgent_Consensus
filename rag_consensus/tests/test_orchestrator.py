@@ -56,7 +56,8 @@ def test_hallucinated_figure_blocks_delivery() -> None:
 def test_rejected_answer_never_exposes_the_draft_anywhere() -> None:
     body = rag_body("DRAFT-SECRETO 365 días", fragments=[{"index": 1, "score": 0.1, "doc_id": "x.md", "source": "x.md", "section": "", "page": None, "start": 0, "end": 1, "text": "otra cosa"}])
     out = run(orchestrator_for(lambda r: httpx.Response(200, json=body)).answer(REQUEST))
-    blob = repr(out) + "".join(f.message for a in out.decision.assessments for f in a.findings)
+    # Sólo textos con contenido potencial (no ids aleatorios: un UUID en hex puede contener "365" por azar).
+    blob = " ".join([str(out.answer), *out.decision.reasons, *(f.message for a in out.decision.assessments for f in a.findings)])
     assert out.answer is None and "DRAFT-SECRETO" not in blob and "365" not in blob
 
 

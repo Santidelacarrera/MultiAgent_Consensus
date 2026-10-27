@@ -68,3 +68,15 @@ jobs:
           python-version: "3.12"
       - run: pip install -e '.[dev]'
       - run: ./scripts/run_e2e.sh
+
+  ecosystem:
+    # Stack unificado "Segundo Cerebro": validación estática (el E2E con contenedores se lanza con ecosystem/scripts/run_e2e_stack.sh)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ecosystem
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose --env-file .env.example --profile e2e config --quiet
+      - run: bash -n scripts/run_e2e_stack.sh scripts/gen_secrets.sh postgres/init/10-databases.sh && sh -n redis/entrypoint.sh
+      - run: python -m py_compile e2e/e2e_stack.py init/bootstrap.py

@@ -1,5 +1,7 @@
 # MultiAgent Consensus
 
+_Nexus Security & AI Lab — componente reutilizable de revisión multi-agente (sin acoplamiento a ningún cliente)._
+
 **Orquestador de consenso multi-agente para GitOps & Architecture PR Gates.**
 
 Cada Pull Request / Merge Request se somete a un debate automatizado entre tres agentes con incentivos opuestos
@@ -66,8 +68,9 @@ decide si el cambio se **aprueba**, se **rechaza** o se **escala a un ingeniero 
 10. [Configuración](#configuración)
 11. [Persistencia (PostgreSQL)](#persistencia-postgresql)
 12. [Capa LLM (Claude / Ollama)](#capa-llm-claude--ollama)
-13. [Desarrollo y tests](#desarrollo-y-tests)
-14. [Alcance y limitaciones](#alcance-y-limitaciones)
+13. [Consenso con agentes simulados y demo](#consenso-con-agentes-simulados-y-demo-de-extremo-a-extremo)
+14. [Desarrollo y tests](#desarrollo-y-tests)
+15. [Alcance y limitaciones](#alcance-y-limitaciones)
 
 ---
 
@@ -472,11 +475,40 @@ adicionales, contra-argumentos y decisiones de defensa en JSON. La salida del LL
 
 ---
 
+## Consenso con agentes simulados y demo de extremo a extremo
+
+`orchestrator/src/demo/` contiene un componente reutilizable para probar la política de consenso **sin LLM, sin red, sin
+Redis ni credenciales**:
+
+- `ScriptedAgent` (`scripted_agent.ts`): agente falso con guion fijo (`approve`, `reject_soft`, `reject_hard`, `veto`).
+  Hereda de `BaseAgent`, de modo que firma con HMAC, ancla sus hallazgos al diff y su voto **se recalcula desde la
+  evidencia** (el guion no declara el voto).
+- `run_scenarios.ts`: monta tres agentes en un bus en memoria con el `DebateEngine` real, permite **falsificar el voto**
+  de cualquiera (`unsigned`, `wrong_key`, `other_agent_key`, `altered_after_signing`) y ejecuta un catálogo de 8 escenarios.
+
+```bash
+npm run demo        # imprime cada escenario con decisión, rondas, votos y fallos; sale con 0 si todos dan lo esperado
+npx jest --runInBand orchestrator/test/consensus_simulated.test.ts   # 28 pruebas
+```
+
+| Escenario | Resultado |
+|---|---|
+| Unanimidad de aprobación / de rechazo | `APPROVED` / `REJECTED` en la ronda 1 |
+| Mayoría de rechazo (2 de 3) | `REJECTED` tras debate |
+| Mayoría de aprobación (2 de 3) con disenso blando | `APPROVED` con condiciones |
+| Mayoría de aprobación con disenso bloqueante (`high`) | `ESCALATED` (humano) |
+| Veto por hallazgo `critical` | `REJECTED` aunque 2 aprueben |
+| **Voto sin firma válida** (4 tipos de falsificación) | no cuenta: el agente se expulsa (`bad_signature`); un veto falsificado no bloquea y dos aprobaciones falsificadas no forman quórum (`ESCALATED`) |
+
+Las pruebas de firma se verificaron por mutación: con `verifyResponse` forzado a devolver `true`, 9 de las 28 fallan.
+
 ## Desarrollo y tests
 
 ```bash
 npm install
 npm run typecheck
+npm run audit                # npm audit (nivel high, incluye dependencias de desarrollo)
+npm run demo                 # demo E2E con agentes simulados
 npm test                     # Jest: agentes, consenso, motor de debate, API HTTP, Redis Streams real, PostgreSQL real + pg-mem
 
 cd gatekeeper
